@@ -9,6 +9,10 @@ from core.config import (
     TELEGRAM_CHAT_ID_COMMON,
     TELEGRAM_CHAT_ID_TRADING,
 )
+from core.ib_monitoring import (
+    build_initial_connect_message,
+    hourly_status_loop,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -21,13 +25,9 @@ async def main() -> None:
     Сейчас:
       - поднимаем коннектор к IB;
       - поднимаем два Telegram-канала (общий и торговый);
+      - шлём первое сообщение с портфелем при подключении;
+      - раз в час шлём статус соединения в общий канал (на начале часа);
       - ждём сигнал остановки и корректно всё закрываем.
-
-    Позже сюда же добавим:
-      - сборщик цен и запись в SQLite;
-      - Telegram-логгер (периодические сообщения о состоянии);
-      - контроль портфеля, риск-менеджер;
-      - торговые стратегии.
     """
 
     # 1. Коннектор к IB
@@ -58,8 +58,12 @@ async def main() -> None:
     connected = await ib.wait_connected(timeout=15)
     if connected:
         logger.info("IB initial connection established, server_time=%s", ib.server_time)
-        # Тестовое сообщение в общий канал — можно потом убрать/переписать
-        await tg_common.send("IB-робот: соединение установлено ✅")
+
+        # даём IB чуть времени получить портфель/аккаунт (без доп. запросов)
+        await asyncio.sleep(1.0)
+
+        text = build_initial_connect_message(ib)
+        await tg_common.send(text)
     else:
         logger.error(
             "IB initial connection NOT established within timeout; "
@@ -69,7 +73,14 @@ async def main() -> None:
             "IB-робот: не удалось подключиться к TWS в отведённое время ⚠️"
         )
 
-    # 5. Ожидание сигналов остановки
+    # 5. Фоновая задача: статус соединения раз в час (в начале часа)
+    hourly_task = asyncio.create_task(
+        hourly_status_loop(ib, tg_common),
+        name="hourly_status",
+    )
+    tasks.append(hourly_task)
+
+    # 6. Ожидание сигналов остановки
     stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()
 
@@ -81,24 +92,19 @@ async def main() -> None:
             pass
 
     try:
-        # Здесь позже появятся:
-        #   - запуск таски мониторинга/heartbeat в Telegram (раз в час)
-        #   - запуск стратегий, writer’ов в БД и т.д.
         await stop_event.wait()
-
     except asyncio.CancelledError:
         logger.info("Main task cancelled, initiating shutdown.")
     finally:
-        # 6. Корректно закрываем всё
+        # 7. Корректно закрываем всё
 
-        # 6.1. Сообщение в общий канал о том, что робот останавливается
+        # 7.1. Сообщение в общий канал о том, что робот останавливается
         try:
             await tg_common.send("IB-робот: остановка работы (shutdown) ⏹")
         except Exception:
-            # на этом этапе нам уже всё равно, просто не падаем
             pass
 
-        # 6.2. Останавливаем коннектор
+        # 7.2. Останавливаем коннектор
         try:
             await ib.shutdown()
         finally:
@@ -106,7 +112,7 @@ async def main() -> None:
                 t.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
 
-        # 6.3. Закрываем Telegram-сессии
+        # 7.3. Закрываем Telegram-сессии
         await tg_common.close()
         await tg_trading.close()
 
@@ -114,7 +120,6 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
-    # Базовая настройка логирования, если оно ещё не сконфигурировано где-то выше
     if not logging.getLogger().handlers:
         logging.basicConfig(
             level=logging.INFO,
@@ -124,5 +129,4 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        # PyCharm Stop часто генерирует KeyboardInterrupt — считаем нормальным завершением.
         logger.info("KeyboardInterrupt received, exiting.")
