@@ -8,12 +8,13 @@ from core.config import (
     TELEGRAM_BOT_TOKEN,
     TELEGRAM_CHAT_ID_COMMON,
     TELEGRAM_CHAT_ID_TRADING,
+    PRICE_DB_PATH,
 )
+from core.price_db import PriceDB
 from core.ib_monitoring import (
     build_initial_connect_message,
     hourly_status_loop,
 )
-
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +30,9 @@ async def main() -> None:
       - раз в час шлём статус соединения в общий канал (на начале часа);
       - ждём сигнал остановки и корректно всё закрываем.
     """
+    # 0. БД цен (SQLite)
+    db = PriceDB(PRICE_DB_PATH)
+    await db.connect()
 
     # 1. Коннектор к IB
     ib = IBConnect(
@@ -115,6 +119,9 @@ async def main() -> None:
         # 7.3. Закрываем Telegram-сессии
         await tg_common.close()
         await tg_trading.close()
+
+        # 7.4. Закрываем БД цен
+        await db.close()
 
         logger.info("Robot shutdown completed.")
 
