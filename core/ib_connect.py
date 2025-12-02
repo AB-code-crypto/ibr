@@ -6,11 +6,6 @@ from typing import Optional
 from ib_insync import IB  # pip install ib_insync
 
 logger = logging.getLogger(__name__)
-if not logger.handlers:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-    )
 
 
 class IBConnect:
@@ -27,13 +22,13 @@ class IBConnect:
     """
 
     def __init__(
-        self,
-        host: str = "127.0.0.1",
-        port: int = 7496,
-        client_id: int = 101,
-        connect_timeout: float = 15.0,
-        keepalive_sec: float = 30.0,
-        max_backoff: float = 30.0,
+            self,
+            host: str = "127.0.0.1",
+            port: int = 7496,
+            client_id: int = 101,
+            connect_timeout: float = 15.0,
+            keepalive_sec: float = 30.0,
+            max_backoff: float = 30.0,
     ):
         # Параметры соединения
         self.host = host
@@ -56,7 +51,6 @@ class IBConnect:
         self._ib.disconnectedEvent += self._on_ib_disconnected
 
         # Keepalive
-        self._keepalive_task: Optional[asyncio.Task] = None
         self._backoff = 1.0
 
     # --------- Публичные свойства ---------
@@ -162,20 +156,9 @@ class IBConnect:
 
         # Первый heartbeat + запуск фонового keepalive
         await self._do_keepalive(initial=True)
-        self._start_keepalive()
         self._connected_evt.set()
 
     async def _teardown(self) -> None:
-        """Остановить keepalive и разорвать соединение."""
-        # Остановить keepalive (идемпотентно)
-        if self._keepalive_task and not self._keepalive_task.done():
-            self._keepalive_task.cancel()
-            try:
-                await self._keepalive_task
-            except asyncio.CancelledError:
-                pass
-            self._keepalive_task = None
-
         # Разорвать соединение (идемпотентно)
         if self._ib.isConnected():
             try:
@@ -186,21 +169,6 @@ class IBConnect:
         self._server_time_utc = None
 
     # --------- Keepalive / heartbeat ---------
-
-    def _start_keepalive(self) -> None:
-        """Запустить фоновую таску heartbeat."""
-        if self._keepalive_task is None:
-            loop = asyncio.get_running_loop()
-            self._keepalive_task = loop.create_task(self._keepalive_loop())
-
-    async def _keepalive_loop(self) -> None:
-        """Фоновый цикл heartbeat: раз в keepalive_sec шлём reqCurrentTimeAsync()."""
-        try:
-            while not self._shutdown and self.is_connected:
-                await asyncio.sleep(self.keepalive_sec)
-                await self._do_keepalive()
-        except asyncio.CancelledError:
-            pass
 
     async def _do_keepalive(self, initial: bool = False) -> None:
         """
