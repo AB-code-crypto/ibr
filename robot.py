@@ -20,6 +20,7 @@ from core.ib_monitoring import (
     hourly_status_loop,
 )
 from core.price_get import PriceCollector, InstrumentConfig, PriceStreamer
+from core.portfolio_monitor import portfolio_monitor_loop
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +56,7 @@ async def main() -> None:
           * шлём в Telegram результат загрузки (сколько баров добавлено и до какой даты);
           * запускаем real-time стриминг 5-секундных баров по текущему рабочему фьючерсу;
       - раз в час шлём статус соединения в общий канал (на начале часа);
+      - мониторим изменения портфеля и шлём их в общий канал;
       - ждём сигнал остановки и корректно всё закрываем.
     """
     # 0. БД цен (SQLite)
@@ -244,6 +246,13 @@ async def main() -> None:
     )
     tasks.append(hourly_task)
 
+    # 6.1. Фоновая задача: мониторинг портфеля
+    portfolio_task = asyncio.create_task(
+        portfolio_monitor_loop(ib, tg_common, stop_event),
+        name="portfolio_monitor",
+    )
+    tasks.append(portfolio_task)
+
     # 7. Ожидание сигнала остановки
     try:
         await stop_event.wait()
@@ -258,7 +267,7 @@ async def main() -> None:
         except Exception:
             pass
 
-        # 8.2. Останавливаем коннектор и все фоновые задачи (включая стримеры)
+        # 8.2. Останавливаем коннектор и все фоновые задачи (включая стримеры и мониторинги)
         try:
             await ib.shutdown()
         finally:
