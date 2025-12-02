@@ -1,7 +1,7 @@
 import asyncio
 import logging
 import signal
-from datetime import timedelta
+from datetime import timedelta, timezone  # добавили timezone
 
 from ib_insync import Future
 
@@ -11,7 +11,8 @@ from core.config import (
     TELEGRAM_BOT_TOKEN,
     TELEGRAM_CHAT_ID_COMMON,
     TELEGRAM_CHAT_ID_TRADING,
-    PRICE_DB_PATH, futures_for_history,
+    PRICE_DB_PATH,
+    futures_for_history,
 )
 from core.price_db import PriceDB
 from core.ib_monitoring import (
@@ -21,6 +22,18 @@ from core.ib_monitoring import (
 from core.price_get import PriceCollector, InstrumentConfig
 
 logger = logging.getLogger(__name__)
+
+
+def _format_dt_utc(dt) -> str:
+    """
+    Красивое форматирование времени бара для сообщений в Telegram:
+    YYYY-MM-DD HH:MM:SS UTC+0
+    """
+    if dt.tzinfo is None:
+        dt_utc = dt.replace(tzinfo=timezone.utc)
+    else:
+        dt_utc = dt.astimezone(timezone.utc)
+    return dt_utc.strftime("%Y-%m-%d %H:%M:%S UTC+0")
 
 
 async def main() -> None:
@@ -34,7 +47,9 @@ async def main() -> None:
       - регистрируем обработчики сигналов (SIGINT/SIGTERM) -> stop_event;
       - при первом успешном подключении:
           * шлём сообщение с портфелем;
-          * докачиваем историю 5-секундных баров по списку фьючерсов;
+          * шлём в Telegram состояние БД по инструментам (последние даты баров);
+          * загружаем/дозагружаем историю 5-секундных баров по списку фьючерсов;
+          * шлём в Telegram результат загрузки (сколько баров добавлено и до какой даты);
       - раз в час шлём статус соединения в общий канал (на начале часа);
       - ждём сигнал остановки и корректно всё закрываем.
     """
@@ -124,23 +139,60 @@ async def main() -> None:
             cfg = InstrumentConfig(
                 name=code,  # имя таблицы в БД = код фьючерса
                 contract=contract,
-                history_lookback=timedelta(days=1),  # fallback, если history_start не задан
-                history_start=meta.get("history_start"),  # явный старт истории
-                expiry=meta.get("expiry"),  # пока не используем, но поле есть
+                history_lookback=timedelta(days=1),           # fallback, если history_start не задан
+                history_start=meta.get("history_start"),      # явный старт истории
+                expiry=meta.get("expiry"),                    # пока не используем, но поле есть
             )
             instrument_configs.append(cfg)
 
         if instrument_configs:
+            # 5.2.a. Статус БД перед загрузкой
+            pre_lines: list[str] = []
+            for cfg in instrument_configs:
+                # На всякий случай убеждаемся, что таблица есть
+                await db.ensure_table(cfg.name)
+                last_dt = await db.get_last_bar_datetime(cfg.name)
+                if last_dt is not None:
+                    pre_lines.append(
+                        f"{cfg.name}: данные в БД до {_format_dt_utc(last_dt)}."
+                    )
+
+            if pre_lines:
+                pre_msg = "IB-робот: состояние исторических данных перед загрузкой:\n" + "\n".join(pre_lines)
+                await tg_common.send(pre_msg)
+
+            # 5.2.b. Запускаем загрузку истории
             logger.info(
                 "Starting historical backfill for instruments: %s",
                 ", ".join(cfg.name for cfg in instrument_configs),
             )
             results = await collector.sync_many(
                 instrument_configs,
-                chunk_seconds=3600,  # по часу 5-секундных баров за запрос
-                cancel_event=stop_event,  # уважать запрос на остановку
+                chunk_seconds=3600,          # по часу 5-секундных баров за запрос
+                cancel_event=stop_event,     # уважать запрос на остановку
             )
             logger.info("Historical backfill results: %r", results)
+
+            # 5.2.c. Статус БД после загрузки (только там, где что-то добавили)
+            post_lines: list[str] = []
+            for cfg in instrument_configs:
+                inserted = results.get(cfg.name, 0)
+                if inserted <= 0:
+                    continue
+
+                last_dt_after = await db.get_last_bar_datetime(cfg.name)
+                if last_dt_after is not None:
+                    last_dt_str = _format_dt_utc(last_dt_after)
+                else:
+                    last_dt_str = "нет данных"
+
+                post_lines.append(
+                    f"{cfg.name}: добавлено баров: {inserted} , последний: {last_dt_str}."
+                )
+
+            if post_lines:
+                post_msg = "IB-робот: загрузка истории завершена:\n" + "\n".join(post_lines)
+                await tg_common.send(post_msg)
         else:
             logger.warning(
                 "No valid instrument configs built for history backfill; "
