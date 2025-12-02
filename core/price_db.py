@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, List, Iterable, Union
 
-import aiosqlite  # pip install aiosqlite
+import aiosqlite
 
 logger = logging.getLogger(__name__)
 
@@ -17,12 +17,12 @@ _TABLE_RE = re.compile(r"^[A-Za-z0-9_]+$")
 @dataclass(slots=True)
 class PriceBar:
     """
-    Одна свеча/бар (по умолчанию 5 секунд, но класс не привязан к таймфрейму).
+    Одна свеча/бар.
 
-    ts  — UTC timestamp (секунды с начала эпохи, целое число).
+    time_utc — время бара в UTC (datetime с tzinfo=UTC).
     open/high/low/close/volume — стандартные поля OHLCV.
     """
-    ts: int
+    time_utc: datetime
     open: float
     high: float
     low: float
@@ -40,21 +40,14 @@ class PriceBar:
             volume: float = 0.0,
     ) -> "PriceBar":
         """
-        Удобный конструктор: принимает datetime и переводит его в UTC timestamp.
+        Удобный конструктор: принимает datetime и приводит его к UTC.
         Если dt без tzinfo, считаем, что это уже UTC.
         """
         if dt.tzinfo is None:
             dt_utc = dt.replace(tzinfo=timezone.utc)
         else:
             dt_utc = dt.astimezone(timezone.utc)
-        ts = int(dt_utc.timestamp())
-        return cls(ts=ts, open=open, high=high, low=low, close=close, volume=volume)
-
-    def to_datetime_utc(self) -> datetime:
-        """
-        Вернуть время бара как datetime в UTC.
-        """
-        return datetime.fromtimestamp(self.ts, tz=timezone.utc)
+        return cls(time_utc=dt_utc, open=open, high=high, low=low, close=close, volume=volume)
 
 
 class PriceDB:
@@ -64,7 +57,7 @@ class PriceDB:
     - Один файл БД (db_path).
     - Для каждого инструмента — отдельная таблица с именем инструмента.
     - Схема таблицы (общая для всех инструментов):
-        ts INTEGER PRIMARY KEY,  -- UTC epoch seconds
+        time_utc TEXT PRIMARY KEY,  -- 'YYYY-MM-DD HH:MM:SS' в UTC
         open   REAL NOT NULL,
         high   REAL NOT NULL,
         low    REAL NOT NULL,
@@ -124,6 +117,22 @@ class PriceDB:
             raise ValueError(f"Недопустимое имя инструмента для таблицы: {instrument!r}")
         return instrument
 
+    @staticmethod
+    def _dt_to_str(dt: datetime) -> str:
+        """
+        datetime (любая tz) -> строка 'YYYY-MM-DD HH:MM:SS' в UTC.
+        """
+        dt_utc = dt.astimezone(timezone.utc)
+        return dt_utc.strftime("%Y-%m-%d %H:%M:%S")
+
+    @staticmethod
+    def _str_to_dt(s: str) -> datetime:
+        """
+        Строка 'YYYY-MM-DD HH:MM:SS' (UTC) -> datetime с tzinfo=UTC.
+        """
+        dt = datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
+        return dt.replace(tzinfo=timezone.utc)
+
     # ------------------------------------------------------------------ #
     # Создание таблиц                                                    #
     # ------------------------------------------------------------------ #
@@ -138,7 +147,7 @@ class PriceDB:
         table = self._table_name(instrument)
         sql = f"""
         CREATE TABLE IF NOT EXISTS "{table}" (
-            ts INTEGER PRIMARY KEY,
+            time_utc TEXT PRIMARY KEY,
             open   REAL NOT NULL,
             high   REAL NOT NULL,
             low    REAL NOT NULL,
@@ -158,7 +167,7 @@ class PriceDB:
         """
         Вставить (или обновить) один бар.
 
-        Используем INSERT OR REPLACE по PRIMARY KEY (ts), чтобы можно было
+        Используем INSERT OR REPLACE по PRIMARY KEY (time_utc), чтобы можно было
         перезаписать бар, если он доформировался или был пересчитан.
         """
         if self._conn is None:
@@ -166,10 +175,11 @@ class PriceDB:
 
         table = self._table_name(instrument)
         sql = f"""
-        INSERT OR REPLACE INTO "{table}" (ts, open, high, low, close, volume)
+        INSERT OR REPLACE INTO "{table}" (time_utc, open, high, low, close, volume)
         VALUES (?, ?, ?, ?, ?, ?)
         """
-        params = (bar.ts, bar.open, bar.high, bar.low, bar.close, bar.volume)
+        time_str = self._dt_to_str(bar.time_utc)
+        params = (time_str, bar.open, bar.high, bar.low, bar.close, bar.volume)
 
         async with self._lock:
             await self._conn.execute(sql, params)
@@ -178,9 +188,7 @@ class PriceDB:
     async def insert_bars(self, instrument: str, bars: Iterable[PriceBar]) -> int:
         """
         Вставить несколько баров за один коммит.
-        Возвращает количество реально вставленных строк.
-
-        Это удобно для backfill'а истории из IB.
+        Возвращает количество реально вставленных баров.
         """
         if self._conn is None:
             raise RuntimeError("PriceDB is not connected")
@@ -191,11 +199,12 @@ class PriceDB:
 
         table = self._table_name(instrument)
         sql = f"""
-        INSERT OR REPLACE INTO "{table}" (ts, open, high, low, close, volume)
+        INSERT OR REPLACE INTO "{table}" (time_utc, open, high, low, close, volume)
         VALUES (?, ?, ?, ?, ?, ?)
         """
         params_seq = [
-            (b.ts, b.open, b.high, b.low, b.close, b.volume) for b in bars_list
+            (self._dt_to_str(b.time_utc), b.open, b.high, b.low, b.close, b.volume)
+            for b in bars_list
         ]
 
         async with self._lock:
@@ -211,15 +220,15 @@ class PriceDB:
     async def fetch_bars(
             self,
             instrument: str,
-            from_ts: Optional[int] = None,
-            to_ts: Optional[int] = None,
+            from_dt: Optional[datetime] = None,
+            to_dt: Optional[datetime] = None,
             limit: Optional[int] = None,
             desc: bool = False,
     ) -> List[PriceBar]:
         """
         Получить бары по инструменту с фильтрацией по времени.
 
-        - from_ts / to_ts — границы по ts (включительно, UTC epoch seconds).
+        - from_dt / to_dt — границы по времени (datetime).
         - limit — ограничение по количеству строк (после сортировки).
         - desc=True — вернуть бары в порядке DESC (обычно для "последних N").
         """
@@ -230,12 +239,12 @@ class PriceDB:
         conditions: List[str] = []
         params: List[object] = []
 
-        if from_ts is not None:
-            conditions.append("ts >= ?")
-            params.append(from_ts)
-        if to_ts is not None:
-            conditions.append("ts <= ?")
-            params.append(to_ts)
+        if from_dt is not None:
+            conditions.append("time_utc >= ?")
+            params.append(self._dt_to_str(from_dt))
+        if to_dt is not None:
+            conditions.append("time_utc <= ?")
+            params.append(self._dt_to_str(to_dt))
 
         where_sql = ""
         if conditions:
@@ -245,9 +254,9 @@ class PriceDB:
         limit_sql = f"LIMIT {int(limit)}" if limit is not None else ""
 
         sql = (
-            f'SELECT ts, open, high, low, close, volume FROM "{table}" '
+            f'SELECT time_utc, open, high, low, close, volume FROM "{table}" '
             f"{where_sql} "
-            f"ORDER BY ts {order_sql} "
+            f"ORDER BY time_utc {order_sql} "
             f"{limit_sql}"
         )
 
@@ -255,33 +264,32 @@ class PriceDB:
             cursor = await self._conn.execute(sql, params)
             rows = await cursor.fetchall()
 
-        return [PriceBar(*row) for row in rows]
+        bars: List[PriceBar] = []
+        for time_str, o, h, l, c, v in rows:
+            dt = self._str_to_dt(time_str)
+            bars.append(PriceBar(time_utc=dt, open=o, high=h, low=l, close=c, volume=v))
 
-    async def get_last_ts(self, instrument: str) -> Optional[int]:
+        return bars
+
+    async def get_last_bar_datetime(self, instrument: str) -> Optional[datetime]:
         """
-        Вернуть timestamp (UTC epoch seconds) последнего бара по инструменту.
-
-        Если таблица пустая или не существует — вернёт None (при условии, что
-        ensure_table уже вызывался где-то выше).
+        Вернуть время последнего бара как datetime в UTC, либо None.
+        Удобно для расчёта "гапа" истории при backfill'е.
         """
         if self._conn is None:
             raise RuntimeError("PriceDB is not connected")
 
         table = self._table_name(instrument)
-        sql = f'SELECT MAX(ts) FROM "{table}"'
+        sql = f'SELECT MAX(time_utc) FROM "{table}"'
 
         async with self._lock:
             cursor = await self._conn.execute(sql)
             row = await cursor.fetchone()
 
-        if not row:
+        if not row or row[0] is None:
             return None
 
-        ts = row[0]
-        if ts is None:
-            return None
-
-        return int(ts)
+        return self._str_to_dt(row[0])
 
     async def get_last_bar(self, instrument: str) -> Optional[PriceBar]:
         """
@@ -291,7 +299,7 @@ class PriceDB:
             raise RuntimeError("PriceDB is not connected")
 
         table = self._table_name(instrument)
-        sql = f'SELECT ts, open, high, low, close, volume FROM "{table}" ORDER BY ts DESC LIMIT 1'
+        sql = f'SELECT time_utc, open, high, low, close, volume FROM "{table}" ORDER BY time_utc DESC LIMIT 1'
 
         async with self._lock:
             cursor = await self._conn.execute(sql)
@@ -300,14 +308,17 @@ class PriceDB:
         if not row:
             return None
 
-        return PriceBar(*row)
+        time_str, o, h, l, c, v = row
+        dt = self._str_to_dt(time_str)
+        return PriceBar(time_utc=dt, open=o, high=h, low=l, close=c, volume=v)
 
-    async def get_last_bar_datetime(self, instrument: str) -> Optional[datetime]:
+    async def get_last_ts(self, instrument: str) -> Optional[int]:
         """
-        Вернуть время последнего бара как datetime в UTC, либо None.
-        Удобно для расчёта "гапа" истории при backfill'е.
+        Опциональный helper: вернуть время последнего бара как epoch seconds.
+        Может пригодиться для быстрого сравнения/экспорта.
         """
-        ts = await self.get_last_ts(instrument)
-        if ts is None:
+        dt = await self.get_last_bar_datetime(instrument)
+        if dt is None:
             return None
-        return datetime.fromtimestamp(ts, tz=timezone.utc)
+        dt_utc = dt.astimezone(timezone.utc)
+        return int(dt_utc.timestamp())
