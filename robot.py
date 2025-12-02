@@ -1,7 +1,7 @@
 import asyncio
 import logging
 import signal
-from datetime import timedelta, timezone  # добавили timezone
+from datetime import timedelta, timezone
 
 from ib_insync import Future
 
@@ -19,7 +19,7 @@ from core.ib_monitoring import (
     build_initial_connect_message,
     hourly_status_loop,
 )
-from core.price_get import PriceCollector, InstrumentConfig
+from core.price_get import PriceCollector, InstrumentConfig, PriceStreamer
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +50,7 @@ async def main() -> None:
           * шлём в Telegram состояние БД по инструментам (последние даты баров);
           * загружаем/дозагружаем историю 5-секундных баров по списку фьючерсов;
           * шлём в Telegram результат загрузки (сколько баров добавлено и до какой даты);
+          * запускаем real-time стриминг 5-секундных баров по тем же инструментам;
       - раз в час шлём статус соединения в общий канал (на начале часа);
       - ждём сигнал остановки и корректно всё закрываем.
     """
@@ -139,9 +140,9 @@ async def main() -> None:
             cfg = InstrumentConfig(
                 name=code,  # имя таблицы в БД = код фьючерса
                 contract=contract,
-                history_lookback=timedelta(days=1),           # fallback, если history_start не задан
-                history_start=meta.get("history_start"),      # явный старт истории
-                expiry=meta.get("expiry"),                    # пока не используем, но поле есть
+                history_lookback=timedelta(days=1),  # fallback, если history_start не задан
+                history_start=meta.get("history_start"),  # явный старт истории
+                expiry=meta.get("expiry"),  # пока не используем, но поле есть
             )
             instrument_configs.append(cfg)
 
@@ -168,8 +169,8 @@ async def main() -> None:
             )
             results = await collector.sync_many(
                 instrument_configs,
-                chunk_seconds=3600,          # по часу 5-секундных баров за запрос
-                cancel_event=stop_event,     # уважать запрос на остановку
+                chunk_seconds=3600,  # по часу 5-секундных баров за запрос
+                cancel_event=stop_event,  # уважать запрос на остановку
             )
             logger.info("Historical backfill results: %r", results)
 
@@ -193,6 +194,15 @@ async def main() -> None:
             if post_lines:
                 post_msg = "IB-робот: загрузка истории завершена:\n" + "\n".join(post_lines)
                 await tg_common.send(post_msg)
+
+            # 5.3. Запускаем real-time стриминг 5-секундных баров по всем инструментам
+            streamer = PriceStreamer(ib=ib.client, db=db)
+            for cfg in instrument_configs:
+                stream_task = asyncio.create_task(
+                    streamer.stream_bars(cfg, cancel_event=stop_event),
+                    name=f"price_stream_{cfg.name}",
+                )
+                tasks.append(stream_task)
         else:
             logger.warning(
                 "No valid instrument configs built for history backfill; "
@@ -230,7 +240,7 @@ async def main() -> None:
         except Exception:
             pass
 
-        # 8.2. Останавливаем коннектор
+        # 8.2. Останавливаем коннектор и все фоновые задачи (включая стримеры)
         try:
             await ib.shutdown()
         finally:
