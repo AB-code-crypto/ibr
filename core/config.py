@@ -16,12 +16,12 @@ TELEGRAM_CHAT_ID_COMMON = -1003208160378  # общий лог-канал
 #  - expiry          — дата экспирации контракта (UTC), на будущее
 futures_for_history = {
     "MNQM5": {
-        "contract_month": "202612",
+        "contract_month": "202506",
         "history_start": None,
         "expiry": None,
     },
     "MNQU5": {
-        "contract_month": "202612",
+        "contract_month": "202509",
         "history_start": None,
         "expiry": None,
     },
