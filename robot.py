@@ -23,6 +23,9 @@ from core.price_get import PriceCollector, InstrumentConfig, PriceStreamer
 
 logger = logging.getLogger(__name__)
 
+# Текущий рабочий фьючерс, для которого запускаем real-time стриминг
+ACTIVE_FUTURE_SYMBOL = "MNQZ5"
+
 
 def _format_dt_utc(dt) -> str:
     """
@@ -50,7 +53,7 @@ async def main() -> None:
           * шлём в Telegram состояние БД по инструментам (последние даты баров);
           * загружаем/дозагружаем историю 5-секундных баров по списку фьючерсов;
           * шлём в Telegram результат загрузки (сколько баров добавлено и до какой даты);
-          * запускаем real-time стриминг 5-секундных баров по тем же инструментам;
+          * запускаем real-time стриминг 5-секундных баров по текущему рабочему фьючерсу;
       - раз в час шлём статус соединения в общий канал (на начале часа);
       - ждём сигнал остановки и корректно всё закрываем.
     """
@@ -195,14 +198,29 @@ async def main() -> None:
                 post_msg = "IB-робот: загрузка истории завершена:\n" + "\n".join(post_lines)
                 await tg_common.send(post_msg)
 
-            # 5.3. Запускаем real-time стриминг 5-секундных баров по всем инструментам
+            # 5.3. Запускаем real-time стриминг 5-секундных баров
+            #     только по текущему рабочему фьючерсу ACTIVE_FUTURE_SYMBOL.
             streamer = PriceStreamer(ib=ib.client, db=db)
-            for cfg in instrument_configs:
+
+            active_cfg = next(
+                (cfg for cfg in instrument_configs if cfg.name == ACTIVE_FUTURE_SYMBOL),
+                None,
+            )
+            if active_cfg is not None:
                 stream_task = asyncio.create_task(
-                    streamer.stream_bars(cfg, cancel_event=stop_event),
-                    name=f"price_stream_{cfg.name}",
+                    streamer.stream_bars(active_cfg, cancel_event=stop_event),
+                    name=f"price_stream_{active_cfg.name}",
                 )
                 tasks.append(stream_task)
+                logger.info(
+                    "Started real-time streaming for active future %s",
+                    ACTIVE_FUTURE_SYMBOL,
+                )
+            else:
+                logger.warning(
+                    "Active future %s not found in instrument_configs; real-time streaming not started",
+                    ACTIVE_FUTURE_SYMBOL,
+                )
         else:
             logger.warning(
                 "No valid instrument configs built for history backfill; "

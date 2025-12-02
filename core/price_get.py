@@ -351,6 +351,7 @@ class PriceStreamer:
         try:
             rt_bars = self.ib.reqRealTimeBars(
                 cfg.contract,
+                barSize=5,
                 whatToShow="TRADES",
                 useRTH=False,
                 realTimeBarsOptions=[],
