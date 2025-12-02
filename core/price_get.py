@@ -8,7 +8,6 @@ from ib_insync import IB, Contract
 
 from .price_db import PriceDB, PriceBar
 
-
 logger = logging.getLogger(__name__)
 
 
@@ -19,12 +18,16 @@ class InstrumentConfig:
 
     name            — логическое имя инструмента / имя таблицы в БД.
     contract        — ib_insync.Contract (Future, Stock и т.п.).
-    history_lookback — сколько истории хотим иметь "назад" от текущего момента,
-                       если БД пустая (по умолчанию 1 день).
+    history_lookback — fallback, сколько истории хотим иметь "назад" от текущего момента,
+                       если БД пустая и history_start не задан.
+    history_start   — явная дата старта истории (UTC); если задана и БД пустая, качаем от неё.
+    expiry          — дата экспирации контракта (UTC), пока только на будущее.
     """
     name: str
     contract: Contract
     history_lookback: timedelta = timedelta(days=1)
+    history_start: Optional[datetime] = None
+    expiry: Optional[datetime] = None
 
 
 class PriceCollector:
@@ -51,11 +54,11 @@ class PriceCollector:
     # ------------------------------------------------------------------ #
 
     async def sync_history_for(
-        self,
-        cfg: InstrumentConfig,
-        *,
-        chunk_seconds: int = 3600,
-        cancel_event: Optional[asyncio.Event] = None,
+            self,
+            cfg: InstrumentConfig,
+            *,
+            chunk_seconds: int = 3600,
+            cancel_event: Optional[asyncio.Event] = None,
     ) -> int:
         """
         Докачать историю 5-секундных баров для одного инструмента.
@@ -94,18 +97,33 @@ class PriceCollector:
         now_utc = datetime.now(timezone.utc)
 
         if last_dt is None:
-            # БД пустая: хотим history_lookback назад от "сейчас"
-            target_start = now_utc - cfg.history_lookback
-            lower_bound = target_start
-            self.log.info(
-                "PriceCollector[%s]: empty DB, will backfill from %s to now (%s)",
-                name,
-                target_start,
-                now_utc,
-            )
+            # БД пустая
+            if cfg.history_start is not None:
+                hs = cfg.history_start
+                # Нормализуем к UTC
+                if hs.tzinfo is None:
+                    hs = hs.replace(tzinfo=timezone.utc)
+                else:
+                    hs = hs.astimezone(timezone.utc)
+
+                lower_bound = hs
+                self.log.info(
+                    "PriceCollector[%s]: empty DB, will backfill from explicit history_start %s to now (%s)",
+                    name,
+                    lower_bound,
+                    now_utc,
+                )
+            else:
+                lower_bound = now_utc - cfg.history_lookback
+                self.log.info(
+                    "PriceCollector[%s]: empty DB, will backfill from %s (now - history_lookback=%s) to now (%s)",
+                    name,
+                    lower_bound,
+                    cfg.history_lookback,
+                    now_utc,
+                )
         else:
             # БД уже содержит часть истории: докачиваем gap от last_dt до "сейчас"
-            target_start = last_dt
             lower_bound = last_dt
             self.log.info(
                 "PriceCollector[%s]: last bar in DB at %s, will backfill up to now (%s)",
@@ -148,7 +166,7 @@ class PriceCollector:
                     barSizeSetting="5 secs",
                     whatToShow="TRADES",
                     useRTH=False,
-                    formatDate=2,      # datetime
+                    formatDate=2,  # datetime
                     keepUpToDate=False,
                     chartOptions=[],
                 )
@@ -256,11 +274,11 @@ class PriceCollector:
         return inserted_total
 
     async def sync_many(
-        self,
-        configs: Sequence[InstrumentConfig],
-        *,
-        chunk_seconds: int = 3600,
-        cancel_event: Optional[asyncio.Event] = None,
+            self,
+            configs: Sequence[InstrumentConfig],
+            *,
+            chunk_seconds: int = 3600,
+            cancel_event: Optional[asyncio.Event] = None,
     ) -> Dict[str, int]:
         """
         Докачать историю сразу для нескольких инструментов (последовательно).

@@ -11,7 +11,7 @@ from core.config import (
     TELEGRAM_BOT_TOKEN,
     TELEGRAM_CHAT_ID_COMMON,
     TELEGRAM_CHAT_ID_TRADING,
-    PRICE_DB_PATH,
+    PRICE_DB_PATH, futures_for_history,
 )
 from core.price_db import PriceDB
 from core.ib_monitoring import (
@@ -21,56 +21,6 @@ from core.ib_monitoring import (
 from core.price_get import PriceCollector, InstrumentConfig
 
 logger = logging.getLogger(__name__)
-
-# Список фьючерсов, для которых качаем историю (5-секундные бары)
-symbols_for_history_data = ["MNQZ5", "MNQH6", "MNQM6", "MNQU6", "MNQZ6"]
-
-# Карта квартальных кодов месяца для MNQ
-_MNQ_MONTH_CODES = {
-    "H": "03",  # March
-    "M": "06",  # June
-    "U": "09",  # September
-    "Z": "12",  # December
-}
-
-
-def _make_mnq_future(symbol_code: str) -> Future:
-    """
-    Преобразовать строку вида 'MNQZ5' в контракт IB для фьючерса MNQ.
-
-    Допущения:
-      - первые 3 символа — базовый тикер ('MNQ');
-      - предпоследний символ — код месяца (H/M/U/Z);
-      - последний символ — последняя цифра года ('5' -> 2025, '6' -> 2026 и т.д.);
-      - торгуем сейчас в 2020-х, поэтому берём 2020 + digit.
-    """
-    if len(symbol_code) < 5:
-        raise ValueError(f"Unsupported MNQ future code: {symbol_code!r}")
-
-    root = symbol_code[:3]  # 'MNQ'
-    month_code = symbol_code[3:-1]  # 'Z', 'H', 'M', 'U'
-    year_digit = symbol_code[-1]  # '5', '6', ...
-
-    if root != "MNQ":
-        raise ValueError(f"Unexpected root symbol (expected 'MNQ'): {symbol_code!r}")
-
-    if month_code not in _MNQ_MONTH_CODES:
-        raise ValueError(
-            f"Unknown month code in symbol {symbol_code!r}: {month_code!r}"
-        )
-
-    month = _MNQ_MONTH_CODES[month_code]
-
-    # Простое допущение: '5' -> 2025, '6' -> 2026 и т.п.
-    year = 2020 + int(year_digit)
-    last_trade_str = f"{year}{month}"  # например, '202512'
-
-    return Future(
-        symbol=root,
-        lastTradeDateOrContractMonth=last_trade_str,
-        exchange="CME",
-        currency="USD",
-    )
 
 
 async def main() -> None:
@@ -143,17 +93,40 @@ async def main() -> None:
         collector = PriceCollector(ib=ib.client, db=db)
 
         instrument_configs: list[InstrumentConfig] = []
-        for code in symbols_for_history_data:
-            try:
-                contract = _make_mnq_future(code)
-            except ValueError as e:
-                logger.error("Skip symbol %s: %s", code, e)
+
+        for code, meta in futures_for_history.items():
+            contract_month = meta.get("contract_month")
+            if not contract_month:
+                logger.error(
+                    "Skip symbol %s: missing contract_month in futures_for_history",
+                    code,
+                )
                 continue
+
+            # Простейшая валидация формата 'YYYYMM'
+            if not isinstance(contract_month, str) or len(contract_month) != 6 or not contract_month.isdigit():
+                logger.error(
+                    "Skip symbol %s: invalid contract_month=%r (expected 'YYYYMM')",
+                    code,
+                    contract_month,
+                )
+                continue
+
+            # Единый способ построения IB-контракта:
+            # symbol='MNQ', lastTradeDateOrContractMonth='YYYYMM'
+            contract = Future(
+                symbol="MNQ",
+                lastTradeDateOrContractMonth=contract_month,
+                exchange="CME",
+                currency="USD",
+            )
 
             cfg = InstrumentConfig(
                 name=code,  # имя таблицы в БД = код фьючерса
                 contract=contract,
-                history_lookback=timedelta(days=1),  # сколько истории качать, если БД пустая
+                history_lookback=timedelta(days=1),  # fallback, если history_start не задан
+                history_start=meta.get("history_start"),  # явный старт истории
+                expiry=meta.get("expiry"),  # пока не используем, но поле есть
             )
             instrument_configs.append(cfg)
 
@@ -171,8 +144,8 @@ async def main() -> None:
         else:
             logger.warning(
                 "No valid instrument configs built for history backfill; "
-                "symbols_for_history_data=%r",
-                symbols_for_history_data,
+                "futures_for_history=%r",
+                futures_for_history,
             )
 
     else:
