@@ -22,6 +22,7 @@ class TradeRequest:
     quantity: int
     expected_price: Optional[float] = None
     submitted_at: datetime = datetime.now(timezone.utc)
+    order_ref: str = "default EA"  # строка для IB orderRef
 
 
 @dataclass(slots=True)
@@ -49,6 +50,7 @@ class TradeResult:
     fills: List[TradeFillInfo]
     total_commission: float
     realized_pnl: float
+    order_ref: str = "default EA"  # тот же orderRef, с которым ушёл ордер
 
 
 class TradeEngine:
@@ -139,16 +141,26 @@ class TradeEngine:
         quantity: int,
         expected_price: Optional[float] = None,
         timeout: float = 60.0,
+        order_ref: str = "default EA",
     ) -> tuple[TradeRequest, TradeResult]:
         """
         Поставить маркет-ордер и дождаться завершения.
+
+        Параметры:
+          - contract: IB Contract
+          - action: "BUY" или "SELL"
+          - quantity: размер ордера (> 0)
+          - expected_price: опционально, для логов/контроля
+          - timeout: сколько ждать завершения ордера
+          - order_ref: строка, которая уйдёт в IB как orderRef
+                       (по умолчанию "default EA")
 
         Возвращает:
           - TradeRequest: факт отправки ордера;
           - TradeResult: итог исполнения.
 
-        Ничего не шлет в Telegram, только данные. Комиссии и realized PnL берутся
-        из fills/commissionReport (если IB их отдает).
+        Ничего не шлёт в Telegram, только данные. Комиссии и realized PnL берутся
+        из fills/commissionReport (если IB их отдаёт).
         """
         if quantity <= 0:
             raise ValueError("quantity must be positive")
@@ -159,22 +171,27 @@ class TradeEngine:
             quantity=quantity,
             expected_price=expected_price,
             submitted_at=datetime.now(timezone.utc),
+            order_ref=order_ref,
         )
 
         local_symbol = contract.localSymbol or contract.symbol
 
         self._log.info(
-            "Sending market order: %s %s x %s (expected_price=%s)",
+            "Sending market order: %s %s x %s (expected_price=%s, order_ref=%r)",
             action,
             local_symbol,
             quantity,
             expected_price,
+            order_ref,
         )
 
         order = MarketOrder(action, quantity)
+        # Ключевая строка: помечаем ордер для идентификации стратегии/робота
+        order.orderRef = order_ref
+
         trade: Trade = self._ib.placeOrder(contract, order)
 
-        # Ждем, пока ордер полностью обработается
+        # Ждём, пока ордер полностью обработается
         await self._wait_trade_done(trade, timeout=timeout)
 
         # Собираем fills и комиссии
@@ -187,13 +204,14 @@ class TradeEngine:
 
         self._log.info(
             "Order %s done: status=%s, filled=%.0f, avg_price=%.2f, "
-            "total_commission=%.2f, realized_pnl=%.2f",
+            "total_commission=%.2f, realized_pnl=%.2f, order_ref=%r",
             trade.order.orderId,
             status,
             filled,
             avg_price,
             total_commission,
             realized_pnl,
+            order_ref,
         )
 
         result = TradeResult(
@@ -204,6 +222,7 @@ class TradeEngine:
             fills=fills,
             total_commission=total_commission,
             realized_pnl=realized_pnl,
+            order_ref=order_ref,
         )
 
         return request, result
@@ -214,6 +233,7 @@ class TradeEngine:
         quantity: int,
         expected_price: Optional[float] = None,
         timeout: float = 60.0,
+        order_ref: str = "default EA",
     ) -> tuple[TradeRequest, TradeResult]:
         """
         Маркет-покупка.
@@ -224,6 +244,7 @@ class TradeEngine:
             quantity=quantity,
             expected_price=expected_price,
             timeout=timeout,
+            order_ref=order_ref,
         )
 
     async def sell_market(
@@ -232,6 +253,7 @@ class TradeEngine:
         quantity: int,
         expected_price: Optional[float] = None,
         timeout: float = 60.0,
+        order_ref: str = "default EA",
     ) -> tuple[TradeRequest, TradeResult]:
         """
         Маркет-продажа.
@@ -242,13 +264,14 @@ class TradeEngine:
             quantity=quantity,
             expected_price=expected_price,
             timeout=timeout,
+            order_ref=order_ref,
         )
 
 
 if __name__ == "__main__":
     # ТЕСТОВЫЙ СЦЕНАРИЙ:
     # - поднимаем отдельный IBConnect (clientId=102, чтобы не конфликтовать с роботом 101);
-    # - покупаем 1 контракт MNQZ5 маркет-ордером;
+    # - продаём 1 контракт MNQZ5 маркет-ордером;
     # - выводим в консоль:
     #     * данные TradeRequest (факт отправки),
     #     * данные TradeResult (итог исполнения).
@@ -284,19 +307,20 @@ if __name__ == "__main__":
 
             engine = TradeEngine(ib_conn.client)
 
-            # Тестируем маркет-покупку 1 контракта MNQZ5.
+            # Тестируем маркет-продажу 1 контракта MNQZ5.
             contract = Future(
                 localSymbol="MNQZ5",
                 exchange="CME",
                 currency="USD",
             )
 
-            print("Отправляем маркет-покупку 1 MNQZ5...")
+            print("Отправляем маркет-продажу 1 MNQZ5...")
 
             req, res = await engine.sell_market(
                 contract=contract,
                 quantity=1,
                 expected_price=None,
+                order_ref="test-strategy-1",
             )
 
             # Сообщение о факте отправки (по данным TradeRequest)
@@ -304,7 +328,8 @@ if __name__ == "__main__":
                 f"Заявка отправлена: {req.action} {req.quantity} x "
                 f"{contract.localSymbol or contract.symbol}, "
                 f"ожид. цена={req.expected_price}, "
-                f"время отправки={req.submitted_at}"
+                f"время отправки={req.submitted_at}, "
+                f"order_ref={req.order_ref!r}"
             )
 
             # Итог исполнения (по данным TradeResult)
@@ -312,7 +337,8 @@ if __name__ == "__main__":
                 f"Исполнение: order_id={res.order_id}, status={res.status}, "
                 f"filled={res.filled}, avg_price={res.avg_fill_price}, "
                 f"commission={res.total_commission}, "
-                f"realized_pnl={res.realized_pnl}"
+                f"realized_pnl={res.realized_pnl}, "
+                f"order_ref={res.order_ref!r}"
             )
 
         finally:
