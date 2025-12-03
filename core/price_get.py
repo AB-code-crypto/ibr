@@ -54,11 +54,11 @@ class PriceCollector:
     # ------------------------------------------------------------------ #
 
     async def sync_history_for(
-        self,
-        cfg: InstrumentConfig,
-        *,
-        chunk_seconds: int = 3600,
-        cancel_event: Optional[asyncio.Event] = None,
+            self,
+            cfg: InstrumentConfig,
+            *,
+            chunk_seconds: int = 3600,
+            cancel_event: Optional[asyncio.Event] = None,
     ) -> int:
         """
         Догрузить историю 5-секундных баров для одного инструмента.
@@ -192,6 +192,7 @@ class PriceCollector:
 
             new_bars: list[PriceBar] = []
             earliest_dt: Optional[datetime] = None
+            latest_dt: Optional[datetime] = None
 
             for bar in bars:
                 bar_dt = getattr(bar, "date", None)
@@ -203,6 +204,8 @@ class PriceCollector:
 
                 if earliest_dt is None or bar_dt < earliest_dt:
                     earliest_dt = bar_dt
+                if latest_dt is None or bar_dt > latest_dt:  # <-- ДОБАВИЛИ
+                    latest_dt = bar_dt
 
                 volume = float(getattr(bar, "volume", 0.0) or 0.0)
                 pb = PriceBar.from_datetime(
@@ -223,6 +226,15 @@ class PriceCollector:
                 )
                 break
 
+            # ЯВНЫЙ ЛОГ ДИАПАЗОНА ЧАНКА
+            if earliest_dt is not None and latest_dt is not None:
+                self.log.info(
+                    "PriceCollector[%s]: chunk [%s ; %s], %d raw bars",
+                    name,
+                    earliest_dt.isoformat(),
+                    latest_dt.isoformat(),
+                    len(bars),
+                )
             inserted = await self.db.insert_bars(name, new_bars)
             inserted_total += inserted
 
@@ -251,11 +263,11 @@ class PriceCollector:
         return inserted_total
 
     async def sync_many(
-        self,
-        configs: Sequence[InstrumentConfig],
-        *,
-        chunk_seconds: int = 3600,
-        cancel_event: Optional[asyncio.Event] = None,
+            self,
+            configs: Sequence[InstrumentConfig],
+            *,
+            chunk_seconds: int = 3600,
+            cancel_event: Optional[asyncio.Event] = None,
     ) -> Dict[str, int]:
         """
         Последовательно синхронизирует историю для набора инструментов.
@@ -297,14 +309,16 @@ class PriceCollector:
     @staticmethod
     def _format_end_datetime(dt: datetime) -> str:
         """
-        Привести datetime к формату, который ожидает IB в endDateTime.
-        'YYYYMMDD HH:MM:SS' в UTC.
+        Форматируем datetime для endDateTime в reqHistoricalData.
+        Всегда используем UTC, чтобы не было разъезда с локальным временем IB.
         """
         if dt.tzinfo is None:
-            dt_utc = dt.replace(tzinfo=timezone.utc)
+            dt = dt.replace(tzinfo=timezone.utc)
         else:
-            dt_utc = dt.astimezone(timezone.utc)
-        return dt_utc.strftime("%Y%m%d %H:%M:%S")
+            dt = dt.astimezone(timezone.utc)
+
+        # IB: "YYYYMMDD HH:MM:SS zzz" — укажем явно UTC
+        return dt.strftime("%Y%m%d %H:%M:%S UTC")
 
 
 # ---------------------------------------------------------------------- #
@@ -325,11 +339,11 @@ class PriceStreamer:
         self.log = logging.getLogger(__name__ + ".PriceStreamer")
 
     async def stream_bars(
-        self,
-        cfg: InstrumentConfig,
-        *,
-        cancel_event: Optional[asyncio.Event] = None,
-        insert_batch_size: int = 100,
+            self,
+            cfg: InstrumentConfig,
+            *,
+            cancel_event: Optional[asyncio.Event] = None,
+            insert_batch_size: int = 100,
     ) -> None:
         """
         Подписаться на real-time 5-секундные бары по одному инструменту и
@@ -340,7 +354,9 @@ class PriceStreamer:
         name = cfg.name
 
         if not self.ib.isConnected():
-            raise RuntimeError("IB is not connected; call PriceStreamer after IBConnect.connect()")
+            raise RuntimeError(
+                "IB is not connected; call PriceStreamer after IBConnect.connect()"
+            )
 
         await self.db.ensure_table(name)
 
@@ -369,7 +385,9 @@ class PriceStreamer:
                 bar = bars[-1]
                 queue.put_nowait(bar)
             except Exception as exc:  # логируем, но не роняем стример
-                self.log.error("PriceStreamer[%s]: failed to enqueue RT bar: %s", name, exc)
+                self.log.error(
+                    "PriceStreamer[%s]: failed to enqueue RT bar: %s", name, exc
+                )
 
         rt_bars.updateEvent += on_update
 
@@ -377,6 +395,15 @@ class PriceStreamer:
 
         try:
             while cancel_event is None or not cancel_event.is_set():
+                # Критично: если IB отвалился — выходим, чтобы внешний код мог
+                # заново поднять стрим после переподключения.
+                if not self.ib.isConnected():
+                    self.log.warning(
+                        "PriceStreamer[%s]: IB disconnected, stopping stream loop",
+                        name,
+                    )
+                    break
+
                 try:
                     # ждём новый бар, но с таймаутом, чтобы периодически делать flush
                     bar = await asyncio.wait_for(queue.get(), timeout=1.0)
@@ -388,7 +415,11 @@ class PriceStreamer:
                 # В ib_insync RealTimeBar.time — datetime в UTC.
                 bar_dt = getattr(bar, "time", None)
                 if bar_dt is None:
-                    self.log.warning("PriceStreamer[%s]: RT bar without .time, skipping: %r", name, bar)
+                    self.log.warning(
+                        "PriceStreamer[%s]: RT bar without .time, skipping: %r",
+                        name,
+                        bar,
+                    )
                     continue
 
                 if bar_dt.tzinfo is None:
@@ -411,7 +442,7 @@ class PriceStreamer:
                 if len(batch) >= insert_batch_size:
                     await self._flush_batch(name, batch)
 
-            # cancel_event выставлен — финальный flush
+            # cancel_event выставлен — или мы вышли из-за disconnect'а — финальный flush
             if batch:
                 await self._flush_batch(name, batch)
 

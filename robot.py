@@ -40,6 +40,82 @@ def _format_dt_utc(dt) -> str:
     return dt_utc.strftime("%Y-%m-%d %H:%M:%S UTC+0")
 
 
+async def price_streamer_loop(
+        ib: IBConnect,
+        db: PriceDB,
+        cfg: InstrumentConfig,
+        stop_event: asyncio.Event,
+) -> None:
+    """
+    Фоновый цикл, который:
+      - ждёт активного соединения с IB;
+      - перед стримингом догружает пропущенную историю 5-секундных баров;
+      - запускает PriceStreamer.stream_bars для инструмента cfg;
+      - при разрыве соединения или ошибке в стримере
+        ждёт переподключения и перезапускает backfill+стриминг.
+
+    Останавливается, когда выставлен stop_event.
+    """
+    streamer = PriceStreamer(ib=ib.client, db=db)
+    collector = PriceCollector(ib=ib.client, db=db)
+
+    while not stop_event.is_set():
+        # 1. Ждём, пока IB будет подключен
+        if not ib.is_connected:
+            await ib.wait_connected(timeout=None)
+            if stop_event.is_set():
+                break
+            # даём IB секунду на синхронизацию портфеля/аккаунта
+            await asyncio.sleep(1.0)
+            continue
+
+        # 2. Перед запуском стриминга — догружаем недостающую историю
+        try:
+            inserted = await collector.sync_history_for(
+                cfg,
+                chunk_seconds=3600,        # по часу 5-секундных баров за запрос
+                cancel_event=stop_event,   # уважать запрос на остановку
+            )
+            if inserted > 0:
+                logger.info(
+                    "price_streamer_loop[%s]: gap backfilled before streaming, inserted=%d",
+                    cfg.name,
+                    inserted,
+                )
+        except Exception as e:
+            # Если IB внезапно отвалился или другая ошибка — логируем и
+            # подождём перед следующей попыткой (цикл пойдёт сначала).
+            logger.error(
+                "price_streamer_loop[%s]: error while backfilling history before streaming: %s",
+                cfg.name,
+                e,
+            )
+            await asyncio.sleep(2.0)
+            continue
+
+        # 3. Запускаем стриминг; если соединение оборвётся — PriceStreamer
+        #    выйдет, и цикл вернётся в начало (где мы снова подождём
+        #    переподключения и ещё раз сделаем backfill-гепа).
+        try:
+            await streamer.stream_bars(cfg, cancel_event=stop_event)
+        except asyncio.CancelledError:
+            # Нормальный shutdown
+            raise
+        except Exception as e:
+            logger.error(
+                "price_streamer_loop[%s]: error in stream_bars: %s",
+                cfg.name,
+                e,
+            )
+            # Небольшой бэкофф перед повторной попыткой
+            await asyncio.sleep(2.0)
+
+        # Дальше цикл пойдёт с начала: при живом соединении сразу снова
+        # сделаем sync_history_for (который увидит, что gap нет, и вернёт 0),
+        # при разрыве — дождёмся reconnection.
+
+
+
 async def main() -> None:
     """
     Главный вход в робота.
@@ -201,21 +277,20 @@ async def main() -> None:
                 await tg_common.send(post_msg)
 
             # 5.3. Запускаем real-time стриминг 5-секундных баров
-            #     только по текущему рабочему фьючерсу ACTIVE_FUTURE_SYMBOL.
-            streamer = PriceStreamer(ib=ib.client, db=db)
-
+            #      только по текущему рабочему фьючерсу ACTIVE_FUTURE_SYMBOL,
+            #      с авто-перезапуском после разрывов соединения.
             active_cfg = next(
                 (cfg for cfg in instrument_configs if cfg.name == ACTIVE_FUTURE_SYMBOL),
                 None,
             )
             if active_cfg is not None:
-                stream_task = asyncio.create_task(
-                    streamer.stream_bars(active_cfg, cancel_event=stop_event),
-                    name=f"price_stream_{active_cfg.name}",
+                price_stream_task = asyncio.create_task(
+                    price_streamer_loop(ib, db, active_cfg, stop_event),
+                    name=f"price_stream_loop_{active_cfg.name}",
                 )
-                tasks.append(stream_task)
+                tasks.append(price_stream_task)
                 logger.info(
-                    "Started real-time streaming for active future %s",
+                    "Started real-time streaming supervisor for active future %s",
                     ACTIVE_FUTURE_SYMBOL,
                 )
             else:
