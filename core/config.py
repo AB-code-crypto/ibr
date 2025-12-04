@@ -3,6 +3,8 @@ from datetime import datetime, timezone
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 PRICE_DB_PATH = BASE_DIR / "data" / "prices.sqlite3"
+# БД для паттернов
+PATTERNS_DB_PATH = BASE_DIR / "data" / "patterns.sqlite3"
 
 # Telegram bot / channels
 TELEGRAM_BOT_TOKEN = "8121278489:AAFrj5FlOQmT4lctIfHOFmkqOqDL60vq5zg"
@@ -17,13 +19,13 @@ TELEGRAM_CHAT_ID_COMMON = -1003208160378  # общий лог-канал
 futures_for_history = {
     "MNQM5": {
         "contract_month": "202506",
-        "history_start": None,
-        "expiry": None,
+        "history_start": datetime(2025, 3, 12, 0, 0, tzinfo=timezone.utc),
+        "expiry": datetime(2025, 6, 19, 8, 30, tzinfo=timezone.utc),
     },
     "MNQU5": {
         "contract_month": "202509",
-        "history_start": None,
-        "expiry": None,
+        "history_start": datetime(2025, 6, 12, 0, 0, tzinfo=timezone.utc),
+        "expiry": datetime(2025, 9, 19, 8, 30, tzinfo=timezone.utc),
     },
     "MNQZ5": {
         # история для Z5: с 2025-09-12 (неделя перед экспирацией U5)

@@ -1,7 +1,7 @@
 import asyncio
 import logging
 import signal
-from datetime import timedelta, timezone
+from datetime import datetime, timedelta, timezone
 
 from ib_insync import Future
 
@@ -21,11 +21,19 @@ from core.ib_monitoring import (
 )
 from core.price_get import PriceCollector, InstrumentConfig, PriceStreamer
 from core.portfolio_monitor import portfolio_monitor_loop
+from core.trade_engine import TradeEngine
+
+from strategy.pattern_strategy import PatternStrategy, PatternSignal
 
 logger = logging.getLogger(__name__)
 
-# Текущий рабочий фьючерс, для которого запускаем real-time стриминг
+# Текущий рабочий фьючерс, для которого запускаем real-time стриминг И торговлю
 ACTIVE_FUTURE_SYMBOL = "MNQZ5"
+
+# Параметры торговой ТС
+PATTERN_INSTRUMENT_ROOT = "MNQ"          # root инструмента в patterns.db
+PATTERN_ORDER_REF = "MNQ_pattern_v1"     # метка ордеров в IB
+PATTERN_TRADE_QTY = 1                    # размер позиции (контрактов)
 
 
 def _format_dt_utc(dt) -> str:
@@ -83,8 +91,6 @@ async def price_streamer_loop(
                     inserted,
                 )
         except Exception as e:
-            # Если IB внезапно отвалился или другая ошибка — логируем и
-            # подождём перед следующей попыткой (цикл пойдёт сначала).
             logger.error(
                 "price_streamer_loop[%s]: error while backfilling history before streaming: %s",
                 cfg.name,
@@ -93,9 +99,7 @@ async def price_streamer_loop(
             await asyncio.sleep(2.0)
             continue
 
-        # 3. Запускаем стриминг; если соединение оборвётся — PriceStreamer
-        #    выйдет, и цикл вернётся в начало (где мы снова подождём
-        #    переподключения и ещё раз сделаем backfill-гепа).
+        # 3. Запускаем стриминг
         try:
             await streamer.stream_bars(cfg, cancel_event=stop_event)
         except asyncio.CancelledError:
@@ -107,13 +111,196 @@ async def price_streamer_loop(
                 cfg.name,
                 e,
             )
-            # Небольшой бэкофф перед повторной попыткой
             await asyncio.sleep(2.0)
 
-        # Дальше цикл пойдёт с начала: при живом соединении сразу снова
-        # сделаем sync_history_for (который увидит, что gap нет, и вернёт 0),
-        # при разрыве — дождёмся reconnection.
+        # Цикл пойдёт с начала
 
+
+async def trading_loop(
+        ib: IBConnect,
+        trade_engine: TradeEngine,
+        strategy: PatternStrategy,
+        cfg: InstrumentConfig,
+        tg_trading: TelegramChannel,
+        stop_event: asyncio.Event,
+) -> None:
+    """
+    Торговый цикл по паттерн-стратегии.
+
+    Логика:
+      - Пока нет позиции: раз в ~5 секунд спрашиваем стратегию.
+        Если она даёт сигнал long/short, открываем позицию PATTERN_TRADE_QTY
+        маркетом и запоминаем час начала.
+      - Пока позиция открыта: не даём новых входов, просто ждём времени
+        выхода (59:50 от часа входа) и закрываем позицию маркетом.
+    """
+    position_side: str = "flat"        # "flat" | "long" | "short"
+    position_qty: int = 0
+    entry_hour_start: datetime | None = None
+
+    logger.info(
+        "Trading loop started for %s (root=%s, qty=%s)",
+        cfg.name,
+        strategy.instrument,
+        PATTERN_TRADE_QTY,
+    )
+
+    # Небольшое выравнивание по 5-секундной сетке
+    while not stop_event.is_set():
+        now = datetime.now(timezone.utc)
+        sleep_rem = 5 - (now.second % 5)
+        if sleep_rem <= 0 or sleep_rem > 5:
+            sleep_rem = 5
+        await asyncio.sleep(sleep_rem)
+        break
+
+    while not stop_event.is_set():
+        # 0. Ждём соединение с IB
+        if not ib.is_connected:
+            await ib.wait_connected(timeout=None)
+            await asyncio.sleep(1.0)
+            continue
+
+        now = datetime.now(timezone.utc)
+
+        # --- Если есть открытая позиция: проверяем время выхода ---
+        if position_side in ("long", "short") and entry_hour_start is not None:
+            exit_time = entry_hour_start.replace(minute=59, second=50, microsecond=0)
+
+            # Если по каким-то причинам час сменился, а мы всё ещё в позиции –
+            # закрываем как можно быстрее.
+            if now >= exit_time:
+                side = "SELL" if position_side == "long" else "BUY"
+                try:
+                    msg = (
+                        f"ТС MNQ: выходим из позиции {position_side} {position_qty} x "
+                        f"{cfg.name} по времени (target exit {exit_time.strftime('%Y-%m-%d %H:%M:%S UTC+0')})."
+                    )
+                    await tg_trading.send(msg)
+
+                    _, res = await trade_engine.market_order(
+                        contract=cfg.contract,
+                        action=side,
+                        quantity=position_qty,
+                        expected_price=None,
+                        timeout=60.0,
+                        order_ref=PATTERN_ORDER_REF + "_exit",
+                    )
+
+                    logger.info(
+                        "Exit order done for %s: side=%s, filled=%.0f, avg_price=%.2f, status=%s",
+                        cfg.name,
+                        side,
+                        res.filled,
+                        res.avg_fill_price,
+                        res.status,
+                    )
+
+                    await tg_trading.send(
+                        f"ТС MNQ: позиция закрыта (side={side}, filled={res.filled}, "
+                        f"avg={res.avg_fill_price:.2f}, status={res.status})."
+                    )
+
+                    position_side = "flat"
+                    position_qty = 0
+                    entry_hour_start = None
+                except Exception as e:
+                    logger.exception("Ошибка при попытке выхода из позиции: %s", e)
+                # После выхода (или попытки) ждём до следующего цикла
+                await asyncio.sleep(1.0)
+                continue
+
+            # Пока не время выхода – просто ждём следующего тика
+            await asyncio.sleep(1.0)
+            continue
+
+        # --- Позиции нет: ищем сигнал на вход ---
+
+        try:
+            signal: PatternSignal = strategy.evaluate_for_contract(cfg.name)
+        except Exception as e:
+            logger.exception("Ошибка в pattern-стратегии: %s", e)
+            await asyncio.sleep(1.0)
+            continue
+
+        # Если стратегия явно не даёт вход – ничего не делаем
+        if signal.action == "flat":
+            await asyncio.sleep(1.0)
+            continue
+
+        # Сейчас мы в flat: рассматриваем вход
+        now_dt = signal.now_time_utc or datetime.now(timezone.utc)
+
+        # Для safety: проверим, что часовая логика ещё валидна
+        hour_start_dt = now_dt.replace(minute=0, second=0, microsecond=0)
+        offset_sec = int((now_dt - hour_start_dt).total_seconds())
+        if offset_sec < strategy.min_entry_minutes_after_hour_start * 60:
+            await asyncio.sleep(1.0)
+            continue
+
+        last_entry_sec = (60 - strategy.min_entry_minutes_before_hour_end) * 60
+        if offset_sec > last_entry_sec:
+            await asyncio.sleep(1.0)
+            continue
+
+        # На этом этапе стратегия хочет входить и по времени всё ок
+        side = "BUY" if signal.action == "long" else "SELL"
+
+        try:
+            # Уведомление в торговый канал (сигнал)
+            stat_str = ""
+            if signal.stats:
+                n = int(signal.stats.get("n", 0))
+                p_up = float(signal.stats.get("p_up", 0.0))
+                mean_ret = float(signal.stats.get("mean_ret", 0.0))
+                stat_str = f" n={n}, p_up={p_up:.3f}, mean_ret={mean_ret:.5f}"
+
+            if signal.similarity is not None:
+                sim_str = f"{signal.similarity:.3f}"
+            else:
+                sim_str = "n/a"
+
+            msg = (
+                f"ТС MNQ: сигнал {signal.action.upper()} по {cfg.name} "
+                f"(reason={signal.reason}, block_slot={signal.slot_sec}, "
+                f"sim={sim_str}{stat_str})."
+            )
+            await tg_trading.send(msg)
+
+            # Отправляем маркет-ордер (фактический вход)
+            _, res = await trade_engine.market_order(
+                contract=cfg.contract,
+                action=side,
+                quantity=PATTERN_TRADE_QTY,
+                expected_price=None,
+                timeout=60.0,
+                order_ref=PATTERN_ORDER_REF,
+            )
+
+            logger.info(
+                "Entry order done for %s: side=%s, filled=%.0f, avg_price=%.2f, status=%s",
+                cfg.name,
+                side,
+                res.filled,
+                res.avg_fill_price,
+                res.status,
+            )
+
+            await tg_trading.send(
+                f"ТС MNQ: вход выполнен (side={side}, filled={res.filled}, "
+                f"avg={res.avg_fill_price:.2f}, status={res.status})."
+            )
+
+            # Фиксируем позицию во внутреннем состоянии
+            if res.filled > 0:
+                position_side = "long" if side == "BUY" else "short"
+                position_qty = int(res.filled)
+                entry_hour_start = hour_start_dt
+
+        except Exception as e:
+            logger.exception("Ошибка при попытке входа в позицию: %s", e)
+
+        await asyncio.sleep(1.0)
 
 
 async def main() -> None:
@@ -131,6 +318,7 @@ async def main() -> None:
           * загружаем/дозагружаем историю 5-секундных баров по списку фьючерсов;
           * шлём в Telegram результат загрузки (сколько баров добавлено и до какой даты);
           * запускаем real-time стриминг 5-секундных баров по текущему рабочему фьючерсу;
+          * запускаем торговый цикл по паттерн-стратегии для ACTIVE_FUTURE_SYMBOL;
       - раз в час шлём статус соединения в общий канал (на начале часа);
       - мониторим изменения портфеля и шлём их в общий канал;
       - ждём сигнал остановки и корректно всё закрываем.
@@ -176,6 +364,8 @@ async def main() -> None:
 
     # 5. Ждём первичного подключения к IB
     connected = await ib.wait_connected(timeout=15)
+    active_cfg: InstrumentConfig | None = None
+
     if connected:
         logger.info("IB initial connection established, server_time=%s", ib.server_time)
 
@@ -212,7 +402,7 @@ async def main() -> None:
             # Единый способ построения IB-контракта:
             # symbol='MNQ', lastTradeDateOrContractMonth='YYYYMM'
             contract = Future(
-                symbol="MNQ",
+                symbol=PATTERN_INSTRUMENT_ROOT,
                 lastTradeDateOrContractMonth=contract_month,
                 exchange="CME",
                 currency="USD",
@@ -231,7 +421,6 @@ async def main() -> None:
             # 5.2.a. Статус БД перед загрузкой
             pre_lines: list[str] = []
             for cfg in instrument_configs:
-                # На всякий случай убеждаемся, что таблица есть
                 await db.ensure_table(cfg.name)
                 last_dt = await db.get_last_bar_datetime(cfg.name)
                 if last_dt is not None:
@@ -277,8 +466,6 @@ async def main() -> None:
                 await tg_common.send(post_msg)
 
             # 5.3. Запускаем real-time стриминг 5-секундных баров
-            #      только по текущему рабочему фьючерсу ACTIVE_FUTURE_SYMBOL,
-            #      с авто-перезапуском после разрывов соединения.
             active_cfg = next(
                 (cfg for cfg in instrument_configs if cfg.name == ACTIVE_FUTURE_SYMBOL),
                 None,
@@ -304,6 +491,31 @@ async def main() -> None:
                 "futures_for_history=%r",
                 futures_for_history,
             )
+
+        # 5.4. Если есть активный конфиг и кластера по MNQ – запускаем торговый цикл
+        if active_cfg is not None:
+            pattern_strategy = PatternStrategy(PATTERN_INSTRUMENT_ROOT)
+            trade_engine = TradeEngine(ib.client, logger=logging.getLogger("TradeEngine"))
+
+            trading_task = asyncio.create_task(
+                trading_loop(
+                    ib=ib,
+                    trade_engine=trade_engine,
+                    strategy=pattern_strategy,
+                    cfg=active_cfg,
+                    tg_trading=tg_trading,
+                    stop_event=stop_event,
+                ),
+                name=f"trading_loop_{active_cfg.name}",
+            )
+            tasks.append(trading_task)
+            logger.info(
+                "Started trading loop for %s with pattern strategy on %s",
+                active_cfg.name,
+                PATTERN_INSTRUMENT_ROOT,
+            )
+        else:
+            logger.warning("Trading loop not started: active_cfg is None.")
 
     else:
         logger.error(
