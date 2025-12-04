@@ -172,9 +172,12 @@ async def trading_loop(
             if now >= exit_time:
                 side = "SELL" if position_side == "long" else "BUY"
                 try:
+                    exit_time_str = exit_time.strftime("%Y-%m-%d %H:%M:%S UTC+0")
                     msg = (
-                        f"ТС MNQ: выходим из позиции {position_side} {position_qty} x "
-                        f"{cfg.name} по времени (target exit {exit_time.strftime('%Y-%m-%d %H:%M:%S UTC+0')})."
+                        "ТС MNQ\n"
+                        f"Выход из позиции по времени.\n"
+                        f"Позиция: {position_side} {position_qty} x {cfg.name}\n"
+                        f"Плановое время выхода: {exit_time_str}"
                     )
                     await tg_trading.send(msg)
 
@@ -188,17 +191,27 @@ async def trading_loop(
                     )
 
                     logger.info(
-                        "Exit order done for %s: side=%s, filled=%.0f, avg_price=%.2f, status=%s",
+                        "Exit order done for %s: side=%s, filled=%.0f, avg_price=%.2f, "
+                        "status=%s, commission=%.2f, realized_pnl=%.2f",
                         cfg.name,
                         side,
                         res.filled,
                         res.avg_fill_price,
                         res.status,
+                        res.total_commission,
+                        res.realized_pnl,
                     )
 
                     await tg_trading.send(
-                        f"ТС MNQ: позиция закрыта (side={side}, filled={res.filled}, "
-                        f"avg={res.avg_fill_price:.2f}, status={res.status})."
+                        "ТС MNQ\n"
+                        "Позиция закрыта.\n"
+                        f"Инструмент: {cfg.name}\n"
+                        f"Направление: {side}\n"
+                        f"Объём (filled): {res.filled}\n"
+                        f"Средняя цена: {res.avg_fill_price:.2f}\n"
+                        f"Статус: {res.status}\n"
+                        f"Результат (realized PnL): {res.realized_pnl:.2f}\n"
+                        f"Комиссия по ордеру: {res.total_commission:.2f}"
                     )
 
                     position_side = "flat"
@@ -249,23 +262,33 @@ async def trading_loop(
         try:
             # Уведомление в торговый канал (сигнал)
             stat_str = ""
+            n = None
+            p_up = None
+            mean_ret = None
             if signal.stats:
                 n = int(signal.stats.get("n", 0))
                 p_up = float(signal.stats.get("p_up", 0.0))
                 mean_ret = float(signal.stats.get("mean_ret", 0.0))
-                stat_str = f" n={n}, p_up={p_up:.3f}, mean_ret={mean_ret:.5f}"
+                stat_str = (
+                    f"n={n}, p_up={p_up:.3f}, mean_ret={mean_ret:.5f}"
+                )
 
             if signal.similarity is not None:
                 sim_str = f"{signal.similarity:.3f}"
             else:
                 sim_str = "n/a"
 
-            msg = (
-                f"ТС MNQ: сигнал {signal.action.upper()} по {cfg.name} "
-                f"(reason={signal.reason}, block_slot={signal.slot_sec}, "
-                f"sim={sim_str}{stat_str})."
-            )
-            await tg_trading.send(msg)
+            msg_parts = [
+                "ТС MNQ",
+                f"Сигнал: {signal.action.upper()} по {cfg.name}",
+                f"Причина: {signal.reason}",
+                f"Слот внутри часа: {signal.slot_sec} с" if signal.slot_sec is not None else "Слот внутри часа: n/a",
+                f"Похожесть (similarity): {sim_str}",
+            ]
+            if stat_str:
+                msg_parts.append(f"Статистика слота: {stat_str}")
+
+            await tg_trading.send("\n".join(msg_parts))
 
             # Отправляем маркет-ордер (фактический вход)
             _, res = await trade_engine.market_order(
@@ -287,8 +310,13 @@ async def trading_loop(
             )
 
             await tg_trading.send(
-                f"ТС MNQ: вход выполнен (side={side}, filled={res.filled}, "
-                f"avg={res.avg_fill_price:.2f}, status={res.status})."
+                "ТС MNQ\n"
+                "Вход в позицию выполнен.\n"
+                f"Инструмент: {cfg.name}\n"
+                f"Направление: {side}\n"
+                f"Объём (filled): {res.filled}\n"
+                f"Средняя цена: {res.avg_fill_price:.2f}\n"
+                f"Статус: {res.status}"
             )
 
             # Фиксируем позицию во внутреннем состоянии
