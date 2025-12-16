@@ -1,7 +1,11 @@
 import asyncio
 import logging
 import signal
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Optional
+from zoneinfo import ZoneInfo
 
 from ib_insync import Future
 
@@ -22,18 +26,25 @@ from core.ib_monitoring import (
 from core.price_get import PriceCollector, InstrumentConfig, PriceStreamer
 from core.portfolio_monitor import portfolio_monitor_loop
 from core.trade_engine import TradeEngine
+from services.quiet_windows import QuietWindowsService
 
-from strategy.pattern_strategy import PatternStrategy, PatternSignal
+from strategies.pattern_pirson import PatternStrategy, PatternSignal
 
 logger = logging.getLogger(__name__)
+
+# Уникальный идентификатор робота внутри системы (для orderRef, логов, quiet windows)
+ROBOT_ID = "pattern_pirson"
 
 # Текущий рабочий фьючерс, для которого запускаем real-time стриминг И торговлю
 ACTIVE_FUTURE_SYMBOL = "MNQZ5"
 
-# Параметры торговой ТС
-PATTERN_INSTRUMENT_ROOT = "MNQ"          # root инструмента в patterns.db
-PATTERN_ORDER_REF = "MNQ_pattern_v1"     # метка ордеров в IB
-PATTERN_TRADE_QTY = 1                    # размер позиции (контрактов)
+# Параметры торговой ТС (пока в robot.py; позже вынесем в spec.py робота)
+PATTERN_INSTRUMENT_ROOT = "MNQ"  # root инструмента в patterns.db
+PATTERN_ORDER_REF = ROBOT_ID  # метка ордеров в IB (orderRef)
+PATTERN_TRADE_QTY = 1  # размер позиции (контрактов)
+
+# Анти-спам для сообщений "сигнал заблокирован окном тишины"
+BLOCKED_NOTICE_COOLDOWN_SECONDS = 300
 
 
 def _format_dt_utc(dt) -> str:
@@ -46,6 +57,13 @@ def _format_dt_utc(dt) -> str:
     else:
         dt_utc = dt.astimezone(timezone.utc)
     return dt_utc.strftime("%Y-%m-%d %H:%M:%S UTC+0")
+
+
+def _format_dt_local(dt_utc: datetime, tz: ZoneInfo) -> str:
+    if dt_utc.tzinfo is None:
+        dt_utc = dt_utc.replace(tzinfo=timezone.utc)
+    dt_local = dt_utc.astimezone(tz)
+    return dt_local.strftime("%Y-%m-%d %H:%M:%S")
 
 
 async def price_streamer_loop(
@@ -81,8 +99,8 @@ async def price_streamer_loop(
         try:
             inserted = await collector.sync_history_for(
                 cfg,
-                chunk_seconds=3600,        # по часу 5-секундных баров за запрос
-                cancel_event=stop_event,   # уважать запрос на остановку
+                chunk_seconds=3600,  # по часу 5-секундных баров за запрос
+                cancel_event=stop_event,  # уважать запрос на остановку
             )
             if inserted > 0:
                 logger.info(
@@ -116,33 +134,58 @@ async def price_streamer_loop(
         # Цикл пойдёт с начала
 
 
+@dataclass
+class _QuietState:
+    active: bool = False
+    reason: Optional[str] = None
+    last_notified_active: bool = False
+    last_notified_reason: Optional[str] = None
+
+
 async def trading_loop(
+        *,
         ib: IBConnect,
         trade_engine: TradeEngine,
         strategy: PatternStrategy,
         cfg: InstrumentConfig,
         tg_trading: TelegramChannel,
+        tg_common: TelegramChannel,
+        quiet_service: QuietWindowsService,
+        robot_id: str,
         stop_event: asyncio.Event,
 ) -> None:
     """
     Торговый цикл по паттерн-стратегии.
 
+    Важно:
+      - стратегии НЕ ходят в quiet windows DB;
+      - фильтрацию "можно ли сейчас отправить приказ" делает робот (оркестратор),
+        через QuietWindowsService;
+      - стратегия возвращает сигнал/интент, робот решает, разрешено ли исполнение.
+
     Логика:
       - Пока нет позиции: раз в ~5 секунд спрашиваем стратегию.
-        Если она даёт сигнал long/short, открываем позицию PATTERN_TRADE_QTY
-        маркетом и запоминаем час начала.
-      - Пока позиция открыта: не даём новых входов, просто ждём времени
-        выхода (59:50 от часа входа) и закрываем позицию маркетом.
+        Если она даёт сигнал long/short, проверяем quiet windows (entry).
+        Если entry разрешён — открываем позицию PATTERN_TRADE_QTY маркетом.
+      - Пока позиция открыта: ждём времени выхода (59:50 от часа входа) и закрываем позицию.
+        Quiet windows для выхода по умолчанию НЕ должны мешать, но опция block_exits поддержана.
     """
-    position_side: str = "flat"        # "flat" | "long" | "short"
+    position_side: str = "flat"  # "flat" | "long" | "short"
     position_qty: int = 0
     entry_hour_start: datetime | None = None
 
+    quiet_state = _QuietState()
+    quiet_tz = ZoneInfo("America/New_York")
+
+    last_blocked_notice_at: Optional[datetime] = None
+    last_blocked_notice_reason: Optional[str] = None
+
     logger.info(
-        "Trading loop started for %s (root=%s, qty=%s)",
+        "Trading loop started for %s (instrument_root=%s, qty=%s, robot_id=%s)",
         cfg.name,
         strategy.instrument,
         PATTERN_TRADE_QTY,
+        robot_id,
     )
 
     # Небольшое выравнивание по 5-секундной сетке
@@ -163,18 +206,85 @@ async def trading_loop(
 
         now = datetime.now(timezone.utc)
 
+        # 1) Пишем в tg_common при входе/выходе из "тишины" (entry-blocked)
+        entry_decision = quiet_service.evaluate(robot_id=robot_id, now_utc=now, action_type="entry")
+        quiet_state.active = not entry_decision.allowed
+        quiet_state.reason = entry_decision.reason
+
+        if quiet_state.active and (not quiet_state.last_notified_active or quiet_state.last_notified_reason != quiet_state.reason):
+            msg = (
+                f"[{robot_id}] Окно тишины: вход в сделки запрещён.\n"
+                f"Причина: {quiet_state.reason or 'n/a'}\n"
+                f"Сейчас (NY): {_format_dt_local(now, quiet_tz)}"
+            )
+            try:
+                await tg_common.send(msg)
+            except Exception:
+                logger.exception("Failed to notify quiet window start.")
+            quiet_state.last_notified_active = True
+            quiet_state.last_notified_reason = quiet_state.reason
+
+        if (not quiet_state.active) and quiet_state.last_notified_active:
+            msg = (
+                f"[{robot_id}] Окно тишины завершено: вход в сделки снова разрешён.\n"
+                f"Причина: {quiet_state.last_notified_reason or 'n/a'}\n"
+                f"Сейчас (NY): {_format_dt_local(now, quiet_tz)}"
+            )
+            try:
+                await tg_common.send(msg)
+            except Exception:
+                logger.exception("Failed to notify quiet window end.")
+            quiet_state.last_notified_active = False
+            quiet_state.last_notified_reason = None
+
         # --- Если есть открытая позиция: проверяем время выхода ---
         if position_side in ("long", "short") and entry_hour_start is not None:
             exit_time = entry_hour_start.replace(minute=59, second=50, microsecond=0)
 
-            # Если по каким-то причинам час сменился, а мы всё ещё в позиции –
-            # закрываем как можно быстрее.
             if now >= exit_time:
+                # Проверка quiet windows для выхода (поддерживаем block_exits, но по умолчанию там 0)
+                exit_decision = quiet_service.evaluate(robot_id=robot_id, now_utc=now, action_type="exit")
+                if not exit_decision.allowed:
+                    # Для безопасности не зависаем в позиции бесконечно: если просрочили выход сильно — выходим принудительно
+                    hard_grace = timedelta(minutes=2)
+                    if now < (exit_time + hard_grace):
+                        # Логируем в общий канал (не чаще cooldown)
+                        should_notify = True
+                        if last_blocked_notice_at is not None:
+                            if (now - last_blocked_notice_at).total_seconds() < BLOCKED_NOTICE_COOLDOWN_SECONDS and last_blocked_notice_reason == (
+                                    exit_decision.reason or ""):
+                                should_notify = False
+                        if should_notify:
+                            try:
+                                await tg_common.send(
+                                    f"[{robot_id}] Выход заблокирован окном тишины.\n"
+                                    f"Инструмент: {cfg.name}\n"
+                                    f"Позиция: {position_side} {position_qty}\n"
+                                    f"Причина: {exit_decision.reason or 'n/a'}"
+                                )
+                            except Exception:
+                                logger.exception("Failed to notify exit blocked.")
+                            last_blocked_notice_at = now
+                            last_blocked_notice_reason = exit_decision.reason or ""
+                        await asyncio.sleep(1.0)
+                        continue
+
+                    # Просрочили выход > 2 минут: принудительно выходим (risk control)
+                    try:
+                        await tg_common.send(
+                            f"[{robot_id}] ВНИМАНИЕ: выход был заблокирован, но превышен лимит задержки.\n"
+                            f"Выполняю принудительный выход.\n"
+                            f"Инструмент: {cfg.name}\n"
+                            f"Причина тишины: {exit_decision.reason or 'n/a'}"
+                        )
+                    except Exception:
+                        pass
+
                 side = "SELL" if position_side == "long" else "BUY"
                 try:
                     exit_time_str = exit_time.strftime("%Y-%m-%d %H:%M:%S UTC+0")
                     msg = (
-                        "ТС MNQ\n"
+                        f"[{robot_id}] ТС MNQ\n"
                         f"Выход из позиции по времени.\n"
                         f"Позиция: {position_side} {position_qty} x {cfg.name}\n"
                         f"Плановое время выхода: {exit_time_str}"
@@ -187,7 +297,7 @@ async def trading_loop(
                         quantity=position_qty,
                         expected_price=None,
                         timeout=60.0,
-                        order_ref=PATTERN_ORDER_REF + "_exit",
+                        order_ref=f"{robot_id}_exit",
                     )
 
                     logger.info(
@@ -203,7 +313,7 @@ async def trading_loop(
                     )
 
                     await tg_trading.send(
-                        "ТС MNQ\n"
+                        f"[{robot_id}] ТС MNQ\n"
                         "Позиция закрыта.\n"
                         f"Инструмент: {cfg.name}\n"
                         f"Направление: {side}\n"
@@ -219,11 +329,10 @@ async def trading_loop(
                     entry_hour_start = None
                 except Exception as e:
                     logger.exception("Ошибка при попытке выхода из позиции: %s", e)
-                # После выхода (или попытки) ждём до следующего цикла
+
                 await asyncio.sleep(1.0)
                 continue
 
-            # Пока не время выхода – просто ждём следующего тика
             await asyncio.sleep(1.0)
             continue
 
@@ -236,7 +345,6 @@ async def trading_loop(
             await asyncio.sleep(1.0)
             continue
 
-        # Если стратегия явно не даёт вход – ничего не делаем
         if signal.action == "flat":
             await asyncio.sleep(1.0)
             continue
@@ -256,30 +364,49 @@ async def trading_loop(
             await asyncio.sleep(1.0)
             continue
 
-        # На этом этапе стратегия хочет входить и по времени всё ок
+        # Фильтр quiet windows (entry)
+        entry_decision = quiet_service.evaluate(robot_id=robot_id, now_utc=now_dt, action_type="entry")
+        if not entry_decision.allowed:
+            # Уведомление в tg_common (не чаще cooldown)
+            should_notify = True
+            if last_blocked_notice_at is not None:
+                if (now_dt - last_blocked_notice_at).total_seconds() < BLOCKED_NOTICE_COOLDOWN_SECONDS and last_blocked_notice_reason == (
+                        entry_decision.reason or ""):
+                    should_notify = False
+
+            if should_notify:
+                msg = (
+                    f"[{robot_id}] Вход заблокирован окном тишины.\n"
+                    f"Инструмент: {cfg.name}\n"
+                    f"Сигнал стратегии: {signal.action.upper()} (reason={signal.reason})\n"
+                    f"Причина тишины: {entry_decision.reason or 'n/a'}"
+                )
+                try:
+                    await tg_common.send(msg)
+                except Exception:
+                    logger.exception("Failed to notify entry blocked.")
+                last_blocked_notice_at = now_dt
+                last_blocked_notice_reason = entry_decision.reason or ""
+
+            await asyncio.sleep(1.0)
+            continue
+
+        # На этом этапе стратегия хочет входить и quiet window разрешает
         side = "BUY" if signal.action == "long" else "SELL"
 
         try:
-            # Уведомление в торговый канал (сигнал)
+            # Уведомление в торговый канал (сигнал/вход)
             stat_str = ""
-            n = None
-            p_up = None
-            mean_ret = None
             if signal.stats:
                 n = int(signal.stats.get("n", 0))
                 p_up = float(signal.stats.get("p_up", 0.0))
                 mean_ret = float(signal.stats.get("mean_ret", 0.0))
-                stat_str = (
-                    f"n={n}, p_up={p_up:.3f}, mean_ret={mean_ret:.5f}"
-                )
+                stat_str = f"n={n}, p_up={p_up:.3f}, mean_ret={mean_ret:.5f}"
 
-            if signal.similarity is not None:
-                sim_str = f"{signal.similarity:.3f}"
-            else:
-                sim_str = "n/a"
+            sim_str = f"{signal.similarity:.3f}" if signal.similarity is not None else "n/a"
 
             msg_parts = [
-                "ТС MNQ",
+                f"[{robot_id}] ТС MNQ",
                 f"Сигнал: {signal.action.upper()} по {cfg.name}",
                 f"Причина: {signal.reason}",
                 f"Слот внутри часа: {signal.slot_sec} с" if signal.slot_sec is not None else "Слот внутри часа: n/a",
@@ -297,7 +424,7 @@ async def trading_loop(
                 quantity=PATTERN_TRADE_QTY,
                 expected_price=None,
                 timeout=60.0,
-                order_ref=PATTERN_ORDER_REF,
+                order_ref=robot_id,
             )
 
             logger.info(
@@ -310,7 +437,7 @@ async def trading_loop(
             )
 
             await tg_trading.send(
-                "ТС MNQ\n"
+                f"[{robot_id}] ТС MNQ\n"
                 "Вход в позицию выполнен.\n"
                 f"Инструмент: {cfg.name}\n"
                 f"Направление: {side}\n"
@@ -319,7 +446,6 @@ async def trading_loop(
                 f"Статус: {res.status}"
             )
 
-            # Фиксируем позицию во внутреннем состоянии
             if res.filled > 0:
                 position_side = "long" if side == "BUY" else "short"
                 position_qty = int(res.filled)
@@ -334,26 +460,17 @@ async def trading_loop(
 async def main() -> None:
     """
     Главный вход в робота.
-
-    Сейчас:
-      - поднимаем коннектор к IB;
-      - поднимаем два Telegram-канала (общий и торговый);
-      - поднимаем SQLite-БД для цен;
-      - регистрируем обработчики сигналов (SIGINT/SIGTERM) -> stop_event;
-      - при первом успешном подключении:
-          * шлём сообщение с портфелем;
-          * шлём в Telegram состояние БД по инструментам (последние даты баров);
-          * загружаем/дозагружаем историю 5-секундных баров по списку фьючерсов;
-          * шлём в Telegram результат загрузки (сколько баров добавлено и до какой даты);
-          * запускаем real-time стриминг 5-секундных баров по текущему рабочему фьючерсу;
-          * запускаем торговый цикл по паттерн-стратегии для ACTIVE_FUTURE_SYMBOL;
-      - раз в час шлём статус соединения в общий канал (на начале часа);
-      - мониторим изменения портфеля и шлём их в общий канал;
-      - ждём сигнал остановки и корректно всё закрываем.
     """
     # 0. БД цен (SQLite)
     db = PriceDB(PRICE_DB_PATH)
     await db.connect()
+
+    # 0.1. Quiet windows DB (отдельный SQLite файл рядом с PRICE_DB_PATH)
+    quiet_db_path = str(Path(PRICE_DB_PATH).with_name("quiet_windows.db"))
+    quiet_service = QuietWindowsService(db_path=quiet_db_path, cache_ttl_seconds=30.0)
+    quiet_service.ensure_schema()
+    # Сидируем базовое окно тишины, если пользователь ещё не добавил правил вручную
+    quiet_service.seed_default_rth_open(robot_id=ROBOT_ID)
 
     # 1. Коннектор к IB
     ib = IBConnect(
@@ -380,31 +497,27 @@ async def main() -> None:
         try:
             loop.add_signal_handler(sig, stop_event.set)
         except NotImplementedError:
-            # На платформах без нормальных сигналов (Windows и т.п.) просто пропускаем
             pass
 
-    # Список фоновых задач для аккуратного shutdown
     tasks: list[asyncio.Task] = []
 
-    # 4. Запускаем фоновую задачу коннектора
+    # 4. Коннектор IB
     connector_task = asyncio.create_task(ib.run_forever(), name="ib_connector")
     tasks.append(connector_task)
 
-    # 5. Ждём первичного подключения к IB
+    # 5. Ждём первичного подключения
     connected = await ib.wait_connected(timeout=15)
     active_cfg: InstrumentConfig | None = None
 
     if connected:
         logger.info("IB initial connection established, server_time=%s", ib.server_time)
-
-        # даём IB чуть времени получить портфель/аккаунт (без доп. запросов)
         await asyncio.sleep(1.0)
 
         # 5.1. Первое сообщение с портфелем
         text = build_initial_connect_message(ib)
         await tg_common.send(text)
 
-        # 5.2. Синхронизация истории 5-секундных баров по списку фьючерсов
+        # 5.2. Синхронизация истории
         collector = PriceCollector(ib=ib.client, db=db)
 
         instrument_configs: list[InstrumentConfig] = []
@@ -412,23 +525,13 @@ async def main() -> None:
         for code, meta in futures_for_history.items():
             contract_month = meta.get("contract_month")
             if not contract_month:
-                logger.error(
-                    "Skip symbol %s: missing contract_month in futures_for_history",
-                    code,
-                )
+                logger.error("Skip symbol %s: missing contract_month in futures_for_history", code)
                 continue
 
-            # Простейшая валидация формата 'YYYYMM'
             if not isinstance(contract_month, str) or len(contract_month) != 6 or not contract_month.isdigit():
-                logger.error(
-                    "Skip symbol %s: invalid contract_month=%r (expected 'YYYYMM')",
-                    code,
-                    contract_month,
-                )
+                logger.error("Skip symbol %s: invalid contract_month=%r (expected 'YYYYMM')", code, contract_month)
                 continue
 
-            # Единый способ построения IB-контракта:
-            # symbol='MNQ', lastTradeDateOrContractMonth='YYYYMM'
             contract = Future(
                 symbol=PATTERN_INSTRUMENT_ROOT,
                 lastTradeDateOrContractMonth=contract_month,
@@ -437,90 +540,65 @@ async def main() -> None:
             )
 
             cfg = InstrumentConfig(
-                name=code,  # имя таблицы в БД = код фьючерса
+                name=code,
                 contract=contract,
-                history_lookback=timedelta(days=1),  # fallback, если history_start не задан
-                history_start=meta.get("history_start"),  # явный старт истории
-                expiry=meta.get("expiry"),  # пока не используем, но поле есть
+                history_lookback=timedelta(days=1),
+                history_start=meta.get("history_start"),
+                expiry=meta.get("expiry"),
             )
             instrument_configs.append(cfg)
 
         if instrument_configs:
-            # 5.2.a. Статус БД перед загрузкой
             pre_lines: list[str] = []
-            for cfg in instrument_configs:
-                await db.ensure_table(cfg.name)
-                last_dt = await db.get_last_bar_datetime(cfg.name)
+            for cfg_i in instrument_configs:
+                await db.ensure_table(cfg_i.name)
+                last_dt = await db.get_last_bar_datetime(cfg_i.name)
                 if last_dt is not None:
-                    pre_lines.append(
-                        f"{cfg.name}: данные в БД до {_format_dt_utc(last_dt)}."
-                    )
+                    pre_lines.append(f"{cfg_i.name}: данные в БД до {_format_dt_utc(last_dt)}.")
 
             if pre_lines:
-                pre_msg = "IB-робот: состояние исторических данных перед загрузкой:\n" + "\n".join(pre_lines)
-                await tg_common.send(pre_msg)
+                await tg_common.send(
+                    "IB-робот: состояние исторических данных перед загрузкой:\n" + "\n".join(pre_lines)
+                )
 
-            # 5.2.b. Запускаем загрузку истории
             logger.info(
                 "Starting historical backfill for instruments: %s",
-                ", ".join(cfg.name for cfg in instrument_configs),
+                ", ".join(cfg_i.name for cfg_i in instrument_configs),
             )
             results = await collector.sync_many(
                 instrument_configs,
-                chunk_seconds=3600,  # по часу 5-секундных баров за запрос
-                cancel_event=stop_event,  # уважать запрос на остановку
+                chunk_seconds=3600,
+                cancel_event=stop_event,
             )
             logger.info("Historical backfill results: %r", results)
 
-            # 5.2.c. Статус БД после загрузки (только там, где что-то добавили)
             post_lines: list[str] = []
-            for cfg in instrument_configs:
-                inserted = results.get(cfg.name, 0)
+            for cfg_i in instrument_configs:
+                inserted = results.get(cfg_i.name, 0)
                 if inserted <= 0:
                     continue
-
-                last_dt_after = await db.get_last_bar_datetime(cfg.name)
-                if last_dt_after is not None:
-                    last_dt_str = _format_dt_utc(last_dt_after)
-                else:
-                    last_dt_str = "нет данных"
-
-                post_lines.append(
-                    f"{cfg.name}: добавлено баров: {inserted} , последний: {last_dt_str}."
-                )
+                last_dt_after = await db.get_last_bar_datetime(cfg_i.name)
+                last_dt_str = _format_dt_utc(last_dt_after) if last_dt_after is not None else "нет данных"
+                post_lines.append(f"{cfg_i.name}: добавлено баров: {inserted} , последний: {last_dt_str}.")
 
             if post_lines:
-                post_msg = "IB-робот: загрузка истории завершена:\n" + "\n".join(post_lines)
-                await tg_common.send(post_msg)
+                await tg_common.send("IB-робот: загрузка истории завершена:\n" + "\n".join(post_lines))
 
-            # 5.3. Запускаем real-time стриминг 5-секундных баров
-            active_cfg = next(
-                (cfg for cfg in instrument_configs if cfg.name == ACTIVE_FUTURE_SYMBOL),
-                None,
-            )
+            # 5.3. Реалтайм-стриминг
+            active_cfg = next((cfg_i for cfg_i in instrument_configs if cfg_i.name == ACTIVE_FUTURE_SYMBOL), None)
             if active_cfg is not None:
                 price_stream_task = asyncio.create_task(
                     price_streamer_loop(ib, db, active_cfg, stop_event),
                     name=f"price_stream_loop_{active_cfg.name}",
                 )
                 tasks.append(price_stream_task)
-                logger.info(
-                    "Started real-time streaming supervisor for active future %s",
-                    ACTIVE_FUTURE_SYMBOL,
-                )
+                logger.info("Started real-time streaming supervisor for active future %s", ACTIVE_FUTURE_SYMBOL)
             else:
-                logger.warning(
-                    "Active future %s not found in instrument_configs; real-time streaming not started",
-                    ACTIVE_FUTURE_SYMBOL,
-                )
+                logger.warning("Active future %s not found; real-time streaming not started", ACTIVE_FUTURE_SYMBOL)
         else:
-            logger.warning(
-                "No valid instrument configs built for history backfill; "
-                "futures_for_history=%r",
-                futures_for_history,
-            )
+            logger.warning("No valid instrument configs built for history backfill; futures_for_history=%r", futures_for_history)
 
-        # 5.4. Если есть активный конфиг и кластера по MNQ – запускаем торговый цикл
+        # 5.4. Торговый цикл
         if active_cfg is not None:
             pattern_strategy = PatternStrategy(PATTERN_INSTRUMENT_ROOT)
             trade_engine = TradeEngine(ib.client, logger=logging.getLogger("TradeEngine"))
@@ -532,57 +610,42 @@ async def main() -> None:
                     strategy=pattern_strategy,
                     cfg=active_cfg,
                     tg_trading=tg_trading,
+                    tg_common=tg_common,
+                    quiet_service=quiet_service,
+                    robot_id=ROBOT_ID,
                     stop_event=stop_event,
                 ),
                 name=f"trading_loop_{active_cfg.name}",
             )
             tasks.append(trading_task)
-            logger.info(
-                "Started trading loop for %s with pattern strategy on %s",
-                active_cfg.name,
-                PATTERN_INSTRUMENT_ROOT,
-            )
+            logger.info("Started trading loop for %s with pattern strategy on %s", active_cfg.name, PATTERN_INSTRUMENT_ROOT)
         else:
             logger.warning("Trading loop not started: active_cfg is None.")
-
     else:
-        logger.error(
-            "IB initial connection NOT established within timeout; "
-            "run_forever() продолжит попытки переподключения."
-        )
-        await tg_common.send(
-            "IB-робот: не удалось подключиться к TWS в отведённое время ⚠️"
-        )
+        logger.error("IB initial connection NOT established within timeout; run_forever() will keep retrying.")
+        await tg_common.send("IB-робот: не удалось подключиться к TWS в отведённое время ⚠️")
 
-    # 6. Фоновая задача: статус соединения раз в час (в начале часа)
-    hourly_task = asyncio.create_task(
-        hourly_status_loop(ib, tg_common),
-        name="hourly_status",
-    )
+    # 6. Статус соединения раз в час
+    hourly_task = asyncio.create_task(hourly_status_loop(ib, tg_common), name="hourly_status")
     tasks.append(hourly_task)
 
-    # 6.1. Фоновая задача: мониторинг портфеля
+    # 6.1. Мониторинг портфеля
     portfolio_task = asyncio.create_task(
         portfolio_monitor_loop(ib, tg_common, stop_event),
         name="portfolio_monitor",
     )
     tasks.append(portfolio_task)
 
-    # 7. Ожидание сигнала остановки
     try:
         await stop_event.wait()
     except asyncio.CancelledError:
         logger.info("Main task cancelled, initiating shutdown.")
     finally:
-        # 8. Корректно закрываем всё
-
-        # 8.1. Сообщение в общий канал о том, что робот останавливается
         try:
             await tg_common.send("IB-робот: остановка работы (shutdown) ⏹")
         except Exception:
             pass
 
-        # 8.2. Останавливаем коннектор и все фоновые задачи (включая стримеры и мониторинги)
         try:
             await ib.shutdown()
         finally:
@@ -590,11 +653,8 @@ async def main() -> None:
                 t.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
 
-        # 8.3. Закрываем Telegram-сессии
         await tg_common.close()
         await tg_trading.close()
-
-        # 8.4. Закрываем БД цен
         await db.close()
 
         logger.info("Robot shutdown completed.")
@@ -607,5 +667,4 @@ if __name__ == "__main__":
             format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
         )
 
-    # Здесь больше не ловим KeyboardInterrupt — SIGINT обрабатывается внутри main()
     asyncio.run(main())
