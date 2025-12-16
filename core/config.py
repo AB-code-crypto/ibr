@@ -2,9 +2,12 @@ from pathlib import Path
 from datetime import datetime, timezone
 
 BASE_DIR = Path(__file__).resolve().parent.parent
-PRICE_DB_PATH = BASE_DIR / "data" / "prices.sqlite3"
-# БД для паттернов
-PATTERNS_DB_PATH = BASE_DIR / "data" / "patterns.sqlite3"
+DATA_DIR = BASE_DIR / "data"
+
+# Базы данных проекта
+PRICE_DB_PATH = DATA_DIR / "prices.sqlite3"
+PATTERNS_DB_PATH = DATA_DIR / "patterns.sqlite3"
+ROBOT_OPS_DB_PATH = DATA_DIR / "robot_ops.db"
 
 # Telegram bot / channels
 TELEGRAM_BOT_TOKEN = "8121278489:AAFrj5FlOQmT4lctIfHOFmkqOqDL60vq5zg"

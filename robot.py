@@ -3,13 +3,18 @@ import logging
 import signal
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 from typing import Optional
 from zoneinfo import ZoneInfo
 
 from ib_insync import Future
 
 from contracts.bot_spec import RobotSpec, Strategy, StrategySignal
+from contracts.robot_registry import (
+    RobotSwitchesStore,
+    load_all_robot_specs,
+    format_robot_specs_for_log,
+)
+
 from core.ib_connect import IBConnect
 from core.telegram import TelegramChannel
 from core.config import (
@@ -17,6 +22,7 @@ from core.config import (
     TELEGRAM_CHAT_ID_COMMON,
     TELEGRAM_CHAT_ID_TRADING,
     PRICE_DB_PATH,
+    ROBOT_OPS_DB_PATH,
     futures_for_history,
 )
 from core.price_db import PriceDB
@@ -29,22 +35,13 @@ from core.portfolio_monitor import portfolio_monitor_loop
 from core.trade_engine import TradeEngine
 from services.quiet_windows import QuietWindowsService
 
-from strategies.pattern_pirson.spec import get_robot_spec
-
 logger = logging.getLogger(__name__)
-
-# Единственный источник истины по конфигурации робота:
-ROBOT_SPEC: RobotSpec = get_robot_spec()
 
 # Анти-спам для сообщений "сигнал заблокирован окном тишины"
 BLOCKED_NOTICE_COOLDOWN_SECONDS = 300
 
 
 def _format_dt_utc(dt) -> str:
-    """
-    Красивое форматирование времени бара для сообщений в Telegram:
-    YYYY-MM-DD HH:MM:SS UTC+0
-    """
     if dt.tzinfo is None:
         dt_utc = dt.replace(tzinfo=timezone.utc)
     else:
@@ -65,35 +62,22 @@ async def price_streamer_loop(
         cfg: InstrumentConfig,
         stop_event: asyncio.Event,
 ) -> None:
-    """
-    Фоновый цикл, который:
-      - ждёт активного соединения с IB;
-      - перед стримингом догружает пропущенную историю 5-секундных баров;
-      - запускает PriceStreamer.stream_bars для инструмента cfg;
-      - при разрыве соединения или ошибке в стримере
-        ждёт переподключения и перезапускает backfill+стриминг.
-
-    Останавливается, когда выставлен stop_event.
-    """
     streamer = PriceStreamer(ib=ib.client, db=db)
     collector = PriceCollector(ib=ib.client, db=db)
 
     while not stop_event.is_set():
-        # 1. Ждём, пока IB будет подключен
         if not ib.is_connected:
             await ib.wait_connected(timeout=None)
             if stop_event.is_set():
                 break
-            # даём IB секунду на синхронизацию портфеля/аккаунта
             await asyncio.sleep(1.0)
             continue
 
-        # 2. Перед запуском стриминга — догружаем недостающую историю
         try:
             inserted = await collector.sync_history_for(
                 cfg,
-                chunk_seconds=3600,  # по часу 5-секундных баров за запрос
-                cancel_event=stop_event,  # уважать запрос на остановку
+                chunk_seconds=3600,
+                cancel_event=stop_event,
             )
             if inserted > 0:
                 logger.info(
@@ -110,11 +94,9 @@ async def price_streamer_loop(
             await asyncio.sleep(2.0)
             continue
 
-        # 3. Запускаем стриминг
         try:
             await streamer.stream_bars(cfg, cancel_event=stop_event)
         except asyncio.CancelledError:
-            # Нормальный shutdown
             raise
         except Exception as e:
             logger.error(
@@ -123,8 +105,6 @@ async def price_streamer_loop(
                 e,
             )
             await asyncio.sleep(2.0)
-
-        # Цикл пойдёт с начала
 
 
 @dataclass
@@ -144,17 +124,10 @@ async def trading_loop(
         tg_trading: TelegramChannel,
         tg_common: TelegramChannel,
         quiet_service: QuietWindowsService,
+        switches: RobotSwitchesStore,
         robot_spec: RobotSpec,
         stop_event: asyncio.Event,
 ) -> None:
-    """
-    Торговый цикл (оркестратор), стратегия подключается через контракт Strategy/StrategySignal.
-
-    Принцип:
-      - стратегия только возвращает intent (long/short/flat) и диагностику;
-      - разрешение на вход/выход (quiet windows) — решает робот;
-      - параметры робота (id, qty, orderRef, контракт) — берём из RobotSpec.
-    """
     robot_id = robot_spec.robot_id
     instrument_root = robot_spec.instrument_root
 
@@ -169,15 +142,15 @@ async def trading_loop(
     last_blocked_notice_reason: Optional[str] = None
 
     logger.info(
-        "Trading loop started for %s (instrument_root=%s, qty=%s, order_ref=%s, contract=%s)",
+        "Trading loop started: robot_id=%s, contract=%s, instrument_root=%s, qty=%s, order_ref=%s",
         robot_id,
+        cfg.name,
         instrument_root,
         robot_spec.trade_qty,
         robot_spec.order_ref,
-        cfg.name,
     )
 
-    # Небольшое выравнивание по 5-секундной сетке
+    # Выравнивание по 5-сек сетке
     while not stop_event.is_set():
         now = datetime.now(timezone.utc)
         sleep_rem = 5 - (now.second % 5)
@@ -187,15 +160,23 @@ async def trading_loop(
         break
 
     while not stop_event.is_set():
-        # 0. Ждём соединение с IB
         if not ib.is_connected:
             await ib.wait_connected(timeout=None)
             await asyncio.sleep(1.0)
             continue
 
+        # LIVE-выключатель: если робот отключили — запрещаем новые входы сразу.
+        enabled = switches.is_enabled(robot_id)
+        if not enabled and position_side == "flat":
+            try:
+                await tg_common.send(f"[{robot_id}] Робот отключён выключателем (robot_switches). Торговый цикл остановлен.")
+            except Exception:
+                logger.exception("Failed to notify robot disabled: %s", robot_id)
+            return
+
         now = datetime.now(timezone.utc)
 
-        # 1) Пишем в tg_common при входе/выходе из "тишины" (entry-blocked)
+        # 1) Сообщения о тишине (entry)
         entry_decision = quiet_service.evaluate(robot_id=robot_id, now_utc=now, action_type="entry")
         quiet_state.active = not entry_decision.allowed
         quiet_state.reason = entry_decision.reason
@@ -226,18 +207,15 @@ async def trading_loop(
             quiet_state.last_notified_active = False
             quiet_state.last_notified_reason = None
 
-        # --- Если есть открытая позиция: проверяем время выхода ---
+        # --- Если есть позиция: управляем выходом, даже если робота выключили ---
         if position_side in ("long", "short") and entry_hour_start is not None:
             exit_time = entry_hour_start.replace(minute=59, second=50, microsecond=0)
 
             if now >= exit_time:
-                # Проверка quiet windows для выхода (поддерживаем block_exits, но по умолчанию там 0)
                 exit_decision = quiet_service.evaluate(robot_id=robot_id, now_utc=now, action_type="exit")
                 if not exit_decision.allowed:
-                    # Для безопасности не зависаем в позиции бесконечно: если просрочили выход сильно — выходим принудительно
                     hard_grace = timedelta(minutes=2)
                     if now < (exit_time + hard_grace):
-                        # Логируем в общий канал (не чаще cooldown)
                         should_notify = True
                         if last_blocked_notice_at is not None:
                             if (now - last_blocked_notice_at).total_seconds() < BLOCKED_NOTICE_COOLDOWN_SECONDS and last_blocked_notice_reason == (
@@ -258,11 +236,9 @@ async def trading_loop(
                         await asyncio.sleep(1.0)
                         continue
 
-                    # Просрочили выход > 2 минут: принудительно выходим (risk control)
                     try:
                         await tg_common.send(
-                            f"[{robot_id}] ВНИМАНИЕ: выход был заблокирован, но превышен лимит задержки.\n"
-                            f"Выполняю принудительный выход.\n"
+                            f"[{robot_id}] ВНИМАНИЕ: выход был заблокирован, но превышен лимит задержки. Принудительный выход.\n"
                             f"Инструмент: {cfg.name}\n"
                             f"Причина тишины: {exit_decision.reason or 'n/a'}"
                         )
@@ -272,13 +248,12 @@ async def trading_loop(
                 side = "SELL" if position_side == "long" else "BUY"
                 try:
                     exit_time_str = exit_time.strftime("%Y-%m-%d %H:%M:%S UTC+0")
-                    msg = (
+                    await tg_trading.send(
                         f"[{robot_id}] ТС {instrument_root}\n"
                         f"Выход из позиции по времени.\n"
                         f"Позиция: {position_side} {position_qty} x {cfg.name}\n"
                         f"Плановое время выхода: {exit_time_str}"
                     )
-                    await tg_trading.send(msg)
 
                     _, res = await trade_engine.market_order(
                         contract=cfg.contract,
@@ -287,18 +262,6 @@ async def trading_loop(
                         expected_price=None,
                         timeout=60.0,
                         order_ref=f"{robot_spec.order_ref}_exit",
-                    )
-
-                    logger.info(
-                        "Exit order done for %s: side=%s, filled=%.0f, avg_price=%.2f, "
-                        "status=%s, commission=%.2f, realized_pnl=%.2f",
-                        cfg.name,
-                        side,
-                        res.filled,
-                        res.avg_fill_price,
-                        res.status,
-                        res.total_commission,
-                        res.realized_pnl,
                     )
 
                     await tg_trading.send(
@@ -325,12 +288,17 @@ async def trading_loop(
             await asyncio.sleep(1.0)
             continue
 
-        # --- Позиции нет: ищем сигнал на вход ---
+        # --- Если робота выключили и позиции нет: до сюда мы не дойдём (return выше) ---
+        # --- Ищем сигнал на вход ---
+        if not enabled:
+            # enabled=False и позиция flat уже обработаны; сюда попадём только если отключили ровно между проверками.
+            await asyncio.sleep(1.0)
+            continue
 
         try:
             sig: StrategySignal = strategy.evaluate_for_contract(cfg.name)
         except Exception as e:
-            logger.exception("Ошибка в стратегии: %s", e)
+            logger.exception("Ошибка в стратегии (%s): %s", robot_id, e)
             await asyncio.sleep(1.0)
             continue
 
@@ -338,14 +306,11 @@ async def trading_loop(
             await asyncio.sleep(1.0)
             continue
 
-        # Сейчас мы в flat: рассматриваем вход
         now_dt = sig.now_time_utc or datetime.now(timezone.utc)
         hour_start_dt = now_dt.replace(minute=0, second=0, microsecond=0)
 
-        # Фильтр quiet windows (entry)
         entry_decision = quiet_service.evaluate(robot_id=robot_id, now_utc=now_dt, action_type="entry")
         if not entry_decision.allowed:
-            # Уведомление в tg_common (не чаще cooldown)
             should_notify = True
             if last_blocked_notice_at is not None:
                 if (now_dt - last_blocked_notice_at).total_seconds() < BLOCKED_NOTICE_COOLDOWN_SECONDS and last_blocked_notice_reason == (
@@ -353,14 +318,13 @@ async def trading_loop(
                     should_notify = False
 
             if should_notify:
-                msg = (
-                    f"[{robot_id}] Вход заблокирован окном тишины.\n"
-                    f"Инструмент: {cfg.name}\n"
-                    f"Сигнал стратегии: {sig.action.upper()} (reason={sig.reason})\n"
-                    f"Причина тишины: {entry_decision.reason or 'n/a'}"
-                )
                 try:
-                    await tg_common.send(msg)
+                    await tg_common.send(
+                        f"[{robot_id}] Вход заблокирован окном тишины.\n"
+                        f"Инструмент: {cfg.name}\n"
+                        f"Сигнал стратегии: {sig.action.upper()} (reason={sig.reason})\n"
+                        f"Причина тишины: {entry_decision.reason or 'n/a'}"
+                    )
                 except Exception:
                     logger.exception("Failed to notify entry blocked.")
                 last_blocked_notice_at = now_dt
@@ -369,11 +333,9 @@ async def trading_loop(
             await asyncio.sleep(1.0)
             continue
 
-        # На этом этапе стратегия хочет входить и quiet window разрешает
         side = "BUY" if sig.action == "long" else "SELL"
 
         try:
-            # Уведомление в торговый канал (сигнал/вход)
             stat_str = ""
             if sig.stats:
                 n = int(sig.stats.get("n", 0))
@@ -395,7 +357,6 @@ async def trading_loop(
 
             await tg_trading.send("\n".join(msg_parts))
 
-            # Отправляем маркет-ордер (фактический вход)
             _, res = await trade_engine.market_order(
                 contract=cfg.contract,
                 action=side,
@@ -403,15 +364,6 @@ async def trading_loop(
                 expected_price=None,
                 timeout=60.0,
                 order_ref=robot_spec.order_ref,
-            )
-
-            logger.info(
-                "Entry order done for %s: side=%s, filled=%.0f, avg_price=%.2f, status=%s",
-                cfg.name,
-                side,
-                res.filled,
-                res.avg_fill_price,
-                res.status,
             )
 
             await tg_trading.send(
@@ -430,36 +382,63 @@ async def trading_loop(
                 entry_hour_start = hour_start_dt
 
         except Exception as e:
-            logger.exception("Ошибка при попытке входа в позицию: %s", e)
+            logger.exception("Ошибка при попытке входа в позицию (%s): %s", robot_id, e)
 
         await asyncio.sleep(1.0)
 
 
-async def main() -> None:
-    """
-    Главный вход в робота.
-    """
-    robot_spec = ROBOT_SPEC
+def _startup_registry_message(all_specs: list[RobotSpec], enabled_specs: list[RobotSpec], ops_db_path: str) -> str:
+    enabled_ids = ", ".join([s.robot_id for s in enabled_specs]) if enabled_specs else "none"
+    lines = [
+        "IB-робот: запуск.",
+        f"ops_db: {ops_db_path}",
+        f"robots_registered: {len(all_specs)}",
+        f"robots_enabled: {len(enabled_specs)} ({enabled_ids})",
+        "",
+        "Реестр (все):",
+        format_robot_specs_for_log(all_specs),
+    ]
+    if enabled_specs and len(enabled_specs) != len(all_specs):
+        lines.append("")
+        lines.append("Активные (enabled):")
+        lines.append(format_robot_specs_for_log(enabled_specs))
+    return "\n".join(lines)
 
-    # 0. БД цен (SQLite)
+
+async def main() -> None:
+    # 1) БД цен
     db = PriceDB(PRICE_DB_PATH)
     await db.connect()
 
-    # 0.1. Quiet windows DB (отдельный SQLite файл рядом с PRICE_DB_PATH)
-    quiet_db_path = str(Path(PRICE_DB_PATH).with_name("quiet_windows.db"))
-    quiet_service = QuietWindowsService(db_path=quiet_db_path, cache_ttl_seconds=30.0)
-    quiet_service.ensure_schema()
-    # Сидируем базовое окно тишины, если пользователь ещё не добавил правил вручную
-    quiet_service.seed_default_rth_open(robot_id=robot_spec.robot_id)
+    # 2) robot_ops.db (операционная БД; также используем для robot_switches/quiet_windows)
+    ops_db_path = str(ROBOT_OPS_DB_PATH)
 
-    # 1. Коннектор к IB
+    # 3) Реестр роботов
+    all_specs = load_all_robot_specs()
+    known_robot_ids = [s.robot_id for s in all_specs]
+
+    # 4) Выключатели
+    switches = RobotSwitchesStore(db_path=ops_db_path, cache_ttl_seconds=10)
+    switches.ensure_schema()
+    switches.seed_defaults(known_robot_ids, default_enabled=True)
+
+    enabled_ids = switches.enabled_robot_ids(known_robot_ids)
+    enabled_specs = [s for s in all_specs if s.robot_id in enabled_ids]
+
+    # 5) Quiet windows сервис (правила по robot_id)
+    quiet_service = QuietWindowsService(db_path=ops_db_path, cache_ttl_seconds=30.0)
+    quiet_service.ensure_schema()
+    for spec in all_specs:
+        quiet_service.seed_default_rth_open(robot_id=spec.robot_id)
+
+    # 6) Коннектор к IB
     ib = IBConnect(
         host="127.0.0.1",
         port=7496,
         client_id=101,
     )
 
-    # 2. Telegram-каналы
+    # 7) Telegram
     tg_common = TelegramChannel(
         bot_token=TELEGRAM_BOT_TOKEN,
         chat_id=TELEGRAM_CHAT_ID_COMMON,
@@ -469,21 +448,12 @@ async def main() -> None:
         chat_id=TELEGRAM_CHAT_ID_TRADING,
     )
 
-    # 2.1. Разовое сообщение о том, что именно запущено (полезно для диагностики)
     try:
-        await tg_common.send(
-            "IB-робот: запуск.\n"
-            f"robot_id: {robot_spec.robot_id}\n"
-            f"active_future: {robot_spec.active_future_symbol}\n"
-            f"instrument_root: {robot_spec.instrument_root}\n"
-            f"trade_qty: {robot_spec.trade_qty}\n"
-            f"order_ref: {robot_spec.order_ref}\n"
-            f"quiet_db: {quiet_db_path}"
-        )
+        await tg_common.send(_startup_registry_message(all_specs, enabled_specs, ops_db_path))
     except Exception:
-        logger.exception("Failed to send startup spec message.")
+        logger.exception("Failed to send startup registry message.")
 
-    # 3. Событие остановки и обработчики сигналов
+    # 8) stop_event + signals
     stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()
 
@@ -495,76 +465,76 @@ async def main() -> None:
 
     tasks: list[asyncio.Task] = []
 
-    # 4. Коннектор IB
     connector_task = asyncio.create_task(ib.run_forever(), name="ib_connector")
     tasks.append(connector_task)
 
-    # 5. Ждём первичного подключения
     connected = await ib.wait_connected(timeout=15)
-    active_cfg: InstrumentConfig | None = None
 
     if connected:
-        logger.info("IB initial connection established, server_time=%s", ib.server_time)
         await asyncio.sleep(1.0)
+        await tg_common.send(build_initial_connect_message(ib))
 
-        # 5.1. Первое сообщение с портфелем
-        text = build_initial_connect_message(ib)
-        await tg_common.send(text)
+        if not enabled_specs:
+            await tg_common.send("IB-робот: нет активных роботов (all disabled). Торговля не запущена.")
+        else:
+            # 9) Собираем уникальные активные контракты, нужные enabled-роботам
+            active_symbols = sorted({s.active_future_symbol for s in enabled_specs})
 
-        # 5.2. Синхронизация истории
-        collector = PriceCollector(ib=ib.client, db=db)
+            # 9.1) Проверяем, что для одного active_future_symbol нет конфликтующих instrument_root
+            symbol_to_root: dict[str, str] = {}
+            for spec in enabled_specs:
+                existing = symbol_to_root.get(spec.active_future_symbol)
+                if existing is None:
+                    symbol_to_root[spec.active_future_symbol] = spec.instrument_root
+                elif existing != spec.instrument_root:
+                    raise ValueError(
+                        "Conflict: same active_future_symbol used with different instrument_root. "
+                        f"symbol={spec.active_future_symbol!r}, roots={existing!r} vs {spec.instrument_root!r}"
+                    )
 
-        instrument_configs: list[InstrumentConfig] = []
+            collector = PriceCollector(ib=ib.client, db=db)
+            instrument_configs: list[InstrumentConfig] = []
 
-        for code, meta in futures_for_history.items():
-            contract_month = meta.get("contract_month")
-            if not contract_month:
-                logger.error("Skip symbol %s: missing contract_month in futures_for_history", code)
-                continue
+            for symbol_code in active_symbols:
+                meta = futures_for_history[symbol_code]  # fail-fast если символа нет в конфиге
 
-            if not isinstance(contract_month, str) or len(contract_month) != 6 or not contract_month.isdigit():
-                logger.error("Skip symbol %s: invalid contract_month=%r (expected 'YYYYMM')", code, contract_month)
-                continue
+                contract_month = meta["contract_month"]
+                if not isinstance(contract_month, str) or len(contract_month) != 6 or not contract_month.isdigit():
+                    raise ValueError(
+                        f"Invalid contract_month for {symbol_code!r}: {contract_month!r} (expected 'YYYYMM')."
+                    )
 
-            contract = Future(
-                symbol=robot_spec.instrument_root,
-                lastTradeDateOrContractMonth=contract_month,
-                exchange="CME",
-                currency="USD",
-            )
+                contract = Future(
+                    symbol=symbol_to_root[symbol_code],
+                    lastTradeDateOrContractMonth=contract_month,
+                    exchange="CME",
+                    currency="USD",
+                )
 
-            cfg = InstrumentConfig(
-                name=code,
-                contract=contract,
-                history_lookback=timedelta(days=1),
-                history_start=meta.get("history_start"),
-                expiry=meta.get("expiry"),
-            )
-            instrument_configs.append(cfg)
+                cfg = InstrumentConfig(
+                    name=symbol_code,
+                    contract=contract,
+                    history_lookback=timedelta(days=1),
+                    history_start=meta.get("history_start"),
+                    expiry=meta.get("expiry"),
+                )
+                instrument_configs.append(cfg)
 
-        if instrument_configs:
+            # 10) Backfill истории только по нужным активным символам
             pre_lines: list[str] = []
             for cfg_i in instrument_configs:
                 await db.ensure_table(cfg_i.name)
                 last_dt = await db.get_last_bar_datetime(cfg_i.name)
                 if last_dt is not None:
                     pre_lines.append(f"{cfg_i.name}: данные в БД до {_format_dt_utc(last_dt)}.")
-
             if pre_lines:
-                await tg_common.send(
-                    "IB-робот: состояние исторических данных перед загрузкой:\n" + "\n".join(pre_lines)
-                )
+                await tg_common.send("IB-робот: состояние истории перед загрузкой:\n" + "\n".join(pre_lines))
 
-            logger.info(
-                "Starting historical backfill for instruments: %s",
-                ", ".join(cfg_i.name for cfg_i in instrument_configs),
-            )
             results = await collector.sync_many(
                 instrument_configs,
                 chunk_seconds=3600,
                 cancel_event=stop_event,
             )
-            logger.info("Historical backfill results: %r", results)
 
             post_lines: list[str] = []
             for cfg_i in instrument_configs:
@@ -574,71 +544,60 @@ async def main() -> None:
                 last_dt_after = await db.get_last_bar_datetime(cfg_i.name)
                 last_dt_str = _format_dt_utc(last_dt_after) if last_dt_after is not None else "нет данных"
                 post_lines.append(f"{cfg_i.name}: добавлено баров: {inserted} , последний: {last_dt_str}.")
-
             if post_lines:
                 await tg_common.send("IB-робот: загрузка истории завершена:\n" + "\n".join(post_lines))
 
-            # 5.3. Реалтайм-стриминг
-            active_cfg = next((cfg_i for cfg_i in instrument_configs if cfg_i.name == robot_spec.active_future_symbol), None)
-            if active_cfg is not None:
-                price_stream_task = asyncio.create_task(
-                    price_streamer_loop(ib, db, active_cfg, stop_event),
-                    name=f"price_stream_loop_{active_cfg.name}",
+            # 11) Реалтайм-стриминг по каждому активному символу
+            cfg_by_symbol = {cfg_i.name: cfg_i for cfg_i in instrument_configs}
+            for cfg_i in instrument_configs:
+                tasks.append(
+                    asyncio.create_task(
+                        price_streamer_loop(ib, db, cfg_i, stop_event),
+                        name=f"price_stream_loop_{cfg_i.name}",
+                    )
                 )
-                tasks.append(price_stream_task)
-                logger.info("Started real-time streaming supervisor for active future %s", robot_spec.active_future_symbol)
-            else:
-                logger.warning("Active future %s not found; real-time streaming not started", robot_spec.active_future_symbol)
-        else:
-            logger.warning("No valid instrument configs built for history backfill; futures_for_history=%r", futures_for_history)
 
-        # 5.4. Торговый цикл
-        if active_cfg is not None:
-            strategy = robot_spec.strategy_factory()
+            # 12) Торговые циклы по каждому роботу
             trade_engine = TradeEngine(ib.client, logger=logging.getLogger("TradeEngine"))
 
-            trading_task = asyncio.create_task(
-                trading_loop(
-                    ib=ib,
-                    trade_engine=trade_engine,
-                    strategy=strategy,
-                    cfg=active_cfg,
-                    tg_trading=tg_trading,
-                    tg_common=tg_common,
-                    quiet_service=quiet_service,
-                    robot_spec=robot_spec,
-                    stop_event=stop_event,
-                ),
-                name=f"trading_loop_{active_cfg.name}",
-            )
-            tasks.append(trading_task)
-            logger.info(
-                "Started trading loop for %s with robot_id=%s (instrument_root=%s)",
-                active_cfg.name,
-                robot_spec.robot_id,
-                robot_spec.instrument_root,
-            )
-        else:
-            logger.warning("Trading loop not started: active_cfg is None.")
+            for spec in enabled_specs:
+                active_cfg = cfg_by_symbol[spec.active_future_symbol]
+                strategy = spec.strategy_factory()
+
+                tasks.append(
+                    asyncio.create_task(
+                        trading_loop(
+                            ib=ib,
+                            trade_engine=trade_engine,
+                            strategy=strategy,
+                            cfg=active_cfg,
+                            tg_trading=tg_trading,
+                            tg_common=tg_common,
+                            quiet_service=quiet_service,
+                            switches=switches,
+                            robot_spec=spec,
+                            stop_event=stop_event,
+                        ),
+                        name=f"trading_loop_{spec.robot_id}_{active_cfg.name}",
+                    )
+                )
+
+                await tg_common.send(
+                    f"[{spec.robot_id}] Запущен.\n"
+                    f"active_future: {spec.active_future_symbol}\n"
+                    f"instrument_root: {spec.instrument_root}\n"
+                    f"trade_qty: {spec.trade_qty}\n"
+                    f"order_ref: {spec.order_ref}"
+                )
+
     else:
-        logger.error("IB initial connection NOT established within timeout; run_forever() will keep retrying.")
         await tg_common.send("IB-робот: не удалось подключиться к TWS в отведённое время ⚠️")
 
-    # 6. Статус соединения раз в час
-    hourly_task = asyncio.create_task(hourly_status_loop(ib, tg_common), name="hourly_status")
-    tasks.append(hourly_task)
-
-    # 6.1. Мониторинг портфеля
-    portfolio_task = asyncio.create_task(
-        portfolio_monitor_loop(ib, tg_common, stop_event),
-        name="portfolio_monitor",
-    )
-    tasks.append(portfolio_task)
+    tasks.append(asyncio.create_task(hourly_status_loop(ib, tg_common), name="hourly_status"))
+    tasks.append(asyncio.create_task(portfolio_monitor_loop(ib, tg_common, stop_event), name="portfolio_monitor"))
 
     try:
         await stop_event.wait()
-    except asyncio.CancelledError:
-        logger.info("Main task cancelled, initiating shutdown.")
     finally:
         try:
             await tg_common.send("IB-робот: остановка работы (shutdown) ⏹")
@@ -655,8 +614,6 @@ async def main() -> None:
         await tg_common.close()
         await tg_trading.close()
         await db.close()
-
-        logger.info("Robot shutdown completed.")
 
 
 if __name__ == "__main__":

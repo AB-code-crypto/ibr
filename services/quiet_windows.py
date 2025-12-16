@@ -16,14 +16,14 @@ class QuietDecision:
 class QuietWindowsService:
     """Централизованный фильтр 'окна тишины' для роботов.
 
-    Хранит правила в SQLite (отдельная БД, не price.db), и отвечает на вопрос:
+    Хранит правила в SQLite (операционная БД робота, напр. robot_ops.db; не price.db), и отвечает на вопрос:
       - можно ли сейчас роботу отправить приказ на вход/выход
 
     Сейчас поддерживаются два типа правил:
       - daily: повторяющееся окно по дням недели и локальному времени (с TZ)
       - once: разовое окно по UTC интервалу
 
-    Таблица: quiet_windows
+    Таблица: quiet_windows (в robot_ops.db)
     """
 
     def __init__(self, *, db_path: str, cache_ttl_seconds: float = 30.0) -> None:
