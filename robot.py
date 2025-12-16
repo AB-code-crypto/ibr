@@ -12,7 +12,12 @@ from contracts.bot_spec import RobotSpec, Strategy, StrategySignal
 from contracts.robot_registry import (
     RobotSwitchesStore,
     load_all_robot_specs,
-    format_robot_specs_for_log,
+)
+from services.telegram_formatters import (
+    _format_dt_local,
+    _format_dt_utc,
+    _startup_registry_message,
+    build_robot_started_message,
 )
 
 from core.ib_connect import IBConnect
@@ -39,21 +44,6 @@ logger = logging.getLogger(__name__)
 
 # Анти-спам для сообщений "сигнал заблокирован окном тишины"
 BLOCKED_NOTICE_COOLDOWN_SECONDS = 300
-
-
-def _format_dt_utc(dt) -> str:
-    if dt.tzinfo is None:
-        dt_utc = dt.replace(tzinfo=timezone.utc)
-    else:
-        dt_utc = dt.astimezone(timezone.utc)
-    return dt_utc.strftime("%Y-%m-%d %H:%M:%S UTC+0")
-
-
-def _format_dt_local(dt_utc: datetime, tz: ZoneInfo) -> str:
-    if dt_utc.tzinfo is None:
-        dt_utc = dt_utc.replace(tzinfo=timezone.utc)
-    dt_local = dt_utc.astimezone(tz)
-    return dt_local.strftime("%Y-%m-%d %H:%M:%S")
 
 
 async def price_streamer_loop(
@@ -387,24 +377,6 @@ async def trading_loop(
         await asyncio.sleep(1.0)
 
 
-def _startup_registry_message(all_specs: list[RobotSpec], enabled_specs: list[RobotSpec], ops_db_path: str) -> str:
-    enabled_ids = ", ".join([s.robot_id for s in enabled_specs]) if enabled_specs else "none"
-    lines = [
-        "IB-робот: запуск.",
-        f"ops_db: {ops_db_path}",
-        f"robots_registered: {len(all_specs)}",
-        f"robots_enabled: {len(enabled_specs)} ({enabled_ids})",
-        "",
-        "Реестр (все):",
-        format_robot_specs_for_log(all_specs),
-    ]
-    if enabled_specs and len(enabled_specs) != len(all_specs):
-        lines.append("")
-        lines.append("Активные (enabled):")
-        lines.append(format_robot_specs_for_log(enabled_specs))
-    return "\n".join(lines)
-
-
 async def main() -> None:
     # 1) БД цен
     db = PriceDB(PRICE_DB_PATH)
@@ -449,7 +421,7 @@ async def main() -> None:
     )
 
     try:
-        await tg_common.send(_startup_registry_message(all_specs, enabled_specs, ops_db_path))
+        await tg_common.send(_startup_registry_message(all_specs, enabled_specs, ops_db_path, quiet_service))
     except Exception:
         logger.exception("Failed to send startup registry message.")
 
@@ -583,11 +555,11 @@ async def main() -> None:
                 )
 
                 await tg_common.send(
-                    f"[{spec.robot_id}] Запущен.\n"
-                    f"active_future: {spec.active_future_symbol}\n"
-                    f"instrument_root: {spec.instrument_root}\n"
-                    f"trade_qty: {spec.trade_qty}\n"
-                    f"order_ref: {spec.order_ref}"
+                    build_robot_started_message(
+                        spec=spec,
+                        quiet_service=quiet_service,
+                        now_utc=datetime.now(timezone.utc),
+                    )
                 )
 
     else:

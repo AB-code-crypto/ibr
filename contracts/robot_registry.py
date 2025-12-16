@@ -63,8 +63,7 @@ def format_robot_specs_for_log(specs: list[RobotSpec]) -> str:
         lines.append(
             "- "
             f"robot_id={s.robot_id} | "
-            f"active_future={s.active_future_symbol} | "
-            f"instrument_root={s.instrument_root} | "
+            f"instrument={s.active_future_symbol} | "
             f"trade_qty={s.trade_qty} | "
             f"order_ref={s.order_ref}"
         )

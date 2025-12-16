@@ -67,6 +67,7 @@ class QuietWindowsService:
             )
             conn.execute("CREATE INDEX IF NOT EXISTS idx_quiet_robot ON quiet_windows(robot_id);")
             conn.commit()
+            self._cache_loaded_at = None
         finally:
             conn.close()
 
@@ -146,6 +147,32 @@ class QuietWindowsService:
                 return QuietDecision(allowed=False, reason=r.get("reason"), rule_id=r.get("id"))
 
         return QuietDecision(allowed=True, reason=None, rule_id=None)
+
+
+    def get_enabled_rules_for_robot(
+        self,
+        *,
+        robot_id: str,
+        now_utc: datetime,
+        include_global: bool = True,
+    ) -> list[dict]:
+        """Вернуть список включённых правил (enabled=1) для робота.
+
+        Используется для логов/диагностики. Возвращает правила из кэша сервиса.
+        include_global=True добавляет правила для robot_id='*' (общие).
+        """
+        if now_utc.tzinfo is None:
+            raise ValueError("now_utc must be timezone-aware (UTC)")
+
+        self._ensure_cache(now_utc)
+
+        rules: list[dict] = []
+        if include_global:
+            rules.extend(self._rules_by_robot.get("*", []))
+        rules.extend(self._rules_by_robot.get(robot_id, []))
+
+        # Защитимся от случайных внешних мутаций.
+        return [dict(r) for r in rules]
 
     # -------------------------
     # Cache / load
