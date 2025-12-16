@@ -1,14 +1,14 @@
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
-from contracts.bot_spec import RobotSpec
-from services.quiet_windows import QuietWindowsService
-
-# Локальное время пользователя (Москва)
 LOCAL_TZ = ZoneInfo("Europe/Moscow")
 
+from contracts.bot_spec import RobotSpec
+from services.quiet_windows import QuietWindowsService
+from contracts.robot_registry import format_robot_specs_for_log
 
-def _format_dt_utc(dt: datetime) -> str:
+
+def _format_dt_utc(dt) -> str:
     if dt.tzinfo is None:
         dt_utc = dt.replace(tzinfo=timezone.utc)
     else:
@@ -19,7 +19,8 @@ def _format_dt_utc(dt: datetime) -> str:
 def _format_dt_local(dt_utc: datetime, tz: ZoneInfo) -> str:
     if dt_utc.tzinfo is None:
         dt_utc = dt_utc.replace(tzinfo=timezone.utc)
-    return dt_utc.astimezone(tz).strftime("%Y-%m-%d %H:%M:%S")
+    dt_local = dt_utc.astimezone(tz)
+    return dt_local.strftime("%Y-%m-%d %H:%M:%S")
 
 
 def _format_weekdays(weekdays: set[int] | None) -> str:
@@ -49,9 +50,10 @@ def _format_quiet_rule_for_log(rule: dict, now_utc: datetime) -> str:
         start_t = rule.get("start_time")
         end_t = rule.get("end_time")
         if not start_t or not end_t:
-            return f"daily (tz={tz_name}) [blocks={blocks_s}] reason={reason}"
+            s = f"daily (tz={tz_name}) [blocks={blocks_s}] reason={reason}"
+            return s + (f" note={note}" if note else "")
 
-        # Для пересчёта локального времени на сегодня берём "сегодня" в TZ правила.
+        # Для пересчёта локального времени берём "сегодня" в TZ правила.
         dt_ref = now_utc.astimezone(tz)
         start_dt = datetime.combine(dt_ref.date(), start_t, tzinfo=tz)
         end_dt = datetime.combine(dt_ref.date(), end_t, tzinfo=tz)
@@ -66,15 +68,14 @@ def _format_quiet_rule_for_log(rule: dict, now_utc: datetime) -> str:
             f"{start_local.strftime('%H:%M')}-{end_local.strftime('%H:%M')} (локальное/MSK) "
             f"[weekdays={_format_weekdays(weekdays)}; blocks={blocks_s}; reason={reason}]"
         )
-        if note:
-            s += f" note={note}"
-        return s
+        return s + (f" note={note}" if note else "")
 
     if kind == "once":
         start_utc = rule.get("start_utc")
         end_utc = rule.get("end_utc")
         if not start_utc or not end_utc:
-            return f"once (tz={tz_name}) [blocks={blocks_s}] reason={reason}"
+            s = f"once (tz={tz_name}) [blocks={blocks_s}] reason={reason}"
+            return s + (f" note={note}" if note else "")
 
         start_ex = start_utc.astimezone(tz)
         end_ex = end_utc.astimezone(tz)
@@ -86,15 +87,10 @@ def _format_quiet_rule_for_log(rule: dict, now_utc: datetime) -> str:
             f"{start_local.strftime('%Y-%m-%d %H:%M')}-{end_local.strftime('%Y-%m-%d %H:%M')} (локальное/MSK) "
             f"[blocks={blocks_s}; reason={reason}]"
         )
-        if note:
-            s += f" note={note}"
-        return s
+        return s + (f" note={note}" if note else "")
 
-    # неизвестный тип правила
     s = f"{kind} (tz={tz_name}) [blocks={blocks_s}] reason={reason}"
-    if note:
-        s += f" note={note}"
-    return s
+    return s + (f" note={note}" if note else "")
 
 
 def format_quiet_windows_for_robot(
@@ -113,32 +109,8 @@ def format_quiet_windows_for_robot(
 
     lines = ["quiet_windows:"]
     for r in rules:
-        lines.append(_format_quiet_rule_for_log(r, now_utc))
+        lines.append("  - " + _format_quiet_rule_for_log(r, now_utc))
     return "\n".join(lines)
-
-
-def build_robot_started_message(
-        *,
-        spec: RobotSpec,
-        quiet_service: QuietWindowsService,
-        now_utc: datetime,
-) -> str:
-    msg = (
-        f"[{spec.robot_id}] Запущен.\n"
-        f"instrument: {spec.active_future_symbol}\n"
-        f"volume: {spec.trade_qty}\n"
-        f"order_ref: {spec.order_ref}"
-    )
-
-    quiet_block = format_quiet_windows_for_robot(
-        robot_id=spec.robot_id,
-        quiet_service=quiet_service,
-        now_utc=now_utc,
-    )
-    if quiet_block:
-        msg += "\n" + quiet_block
-
-    return msg
 
 
 def _startup_registry_message(
@@ -147,14 +119,38 @@ def _startup_registry_message(
         ops_db_path: str,
         quiet_service: QuietWindowsService,
 ) -> str:
+    # Variant B: всё важное — в одном стартовом сообщении (без дублей "на каждый робот").
+    enabled_ids = ", ".join([s.robot_id for s in enabled_specs]) if enabled_specs else "none"
     now_utc = datetime.now(timezone.utc)
 
-    enabled_ids = ", ".join([s.robot_id for s in enabled_specs]) if enabled_specs else "none"
-
-    lines: list[str] = [
+    lines = [
         "IB-робот: запуск.",
-        f"robots_registered: {len(all_specs)}",
         f"robots_enabled: {len(enabled_specs)} ({enabled_ids})",
+        "",
+        "Реестр (все):",
+        format_robot_specs_for_log(all_specs),
     ]
+
+    if enabled_specs and len(enabled_specs) != len(all_specs):
+        lines.append("")
+        lines.append("Активные (enabled):")
+        lines.append(format_robot_specs_for_log(enabled_specs))
+
+    # Окна тишины — только если правила реально есть.
+    if enabled_specs:
+        quiet_blocks: list[str] = []
+        for s in enabled_specs:
+            qw = format_quiet_windows_for_robot(
+                robot_id=s.robot_id,
+                quiet_service=quiet_service,
+                now_utc=now_utc,
+            )
+            if qw:
+                quiet_blocks.append(f"robot_id={s.robot_id}\n{qw}")
+
+        if quiet_blocks:
+            lines.append("")
+            lines.append("Окна тишины (enabled):\n")
+            lines.extend(quiet_blocks)
 
     return "\n".join(lines)
