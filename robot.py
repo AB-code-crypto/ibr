@@ -1,7 +1,6 @@
 import asyncio
 import logging
 import signal
-from datetime import timedelta
 
 from contracts.robot_registry import RobotSwitchesStore, load_all_robot_specs
 from core.config import (
