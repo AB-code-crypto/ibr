@@ -1,11 +1,11 @@
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
-LOCAL_TZ = ZoneInfo("Europe/Moscow")
-
 from contracts.bot_spec import RobotSpec
-from services.quiet_windows import QuietWindowsService
 from contracts.robot_registry import format_robot_specs_for_log
+from services.quiet_windows import QuietWindowsService
+
+LOCAL_TZ = ZoneInfo("Europe/Moscow")
 
 
 def _format_dt_utc(dt) -> str:
@@ -93,13 +93,13 @@ def _format_quiet_rule_for_log(rule: dict, now_utc: datetime) -> str:
     return s + (f" note={note}" if note else "")
 
 
-def format_quiet_windows_for_robot(
-        *,
-        robot_id: str,
-        quiet_service: QuietWindowsService,
-        now_utc: datetime,
+async def format_quiet_windows_for_robot(
+    *,
+    robot_id: str,
+    quiet_service: QuietWindowsService,
+    now_utc: datetime,
 ) -> str:
-    rules = quiet_service.get_enabled_rules_for_robot(
+    rules = await quiet_service.get_enabled_rules_for_robot(
         robot_id=robot_id,
         now_utc=now_utc,
         include_global=True,
@@ -113,18 +113,20 @@ def format_quiet_windows_for_robot(
     return "\n".join(lines)
 
 
-def _startup_registry_message(
-        all_specs: list[RobotSpec],
-        enabled_specs: list[RobotSpec],
-        ops_db_path: str,
-        quiet_service: QuietWindowsService,
+async def _startup_registry_message(
+    all_specs: list[RobotSpec],
+    enabled_specs: list[RobotSpec],
+    ops_db_path: str,
+    quiet_service: QuietWindowsService,
 ) -> str:
-    # Variant B: всё важное — в одном стартовом сообщении (без дублей "на каждый робот").
+    """Variant B: всё важное — в одном стартовом сообщении (без дублей)."""
     enabled_ids = ", ".join([s.robot_id for s in enabled_specs]) if enabled_specs else "none"
     now_utc = datetime.now(timezone.utc)
 
     lines = [
         "IB-робот: запуск.",
+        f"ops_db: {ops_db_path}",
+        f"robots_registered: {len(all_specs)}",
         f"robots_enabled: {len(enabled_specs)} ({enabled_ids})",
         "",
         "Реестр (все):",
@@ -140,17 +142,17 @@ def _startup_registry_message(
     if enabled_specs:
         quiet_blocks: list[str] = []
         for s in enabled_specs:
-            qw = format_quiet_windows_for_robot(
+            qw = await format_quiet_windows_for_robot(
                 robot_id=s.robot_id,
                 quiet_service=quiet_service,
                 now_utc=now_utc,
             )
             if qw:
-                quiet_blocks.append(f"robot_id={s.robot_id}\n{qw}")
+                quiet_blocks.append(f"- robot_id={s.robot_id}\n{qw}")
 
         if quiet_blocks:
             lines.append("")
-            lines.append("Окна тишины (enabled):\n")
+            lines.append("Окна тишины (enabled):")
             lines.extend(quiet_blocks)
 
     return "\n".join(lines)

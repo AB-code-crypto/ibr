@@ -6,18 +6,17 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
-from core.patterns_db import get_connection as get_patterns_conn
-
+from .patterns_db import get_connection as get_patterns_conn
 from .types import ClusterRuntimeInfo
 
 logger = logging.getLogger(__name__)
 
 
 def load_clusters(
-        *,
-        patterns_db_path: str,
-        instrument: str,
-        bars_per_segment: int,
+    *,
+    patterns_db_path: str,
+    instrument: str,
+    bars_per_segment: int,
 ) -> Tuple[Dict[int, List[ClusterRuntimeInfo]], Optional[int]]:
     """Load hour_clusters for given instrument.
 

@@ -7,7 +7,7 @@ from typing import Dict, Optional
 import numpy as np
 
 
-@dataclass
+@dataclass(slots=True)
 class ClusterRuntimeInfo:
     """Cluster center + precomputed slot statistics (loaded from patterns.db)."""
 
@@ -18,7 +18,7 @@ class ClusterRuntimeInfo:
     session_block: int
 
 
-@dataclass
+@dataclass(slots=True)
 class PatternSignal:
     """Decision produced by the strategy for the current moment."""
 

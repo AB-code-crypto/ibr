@@ -19,12 +19,14 @@ logger = logging.getLogger(__name__)
 # Анти-спам для сообщений "сигнал заблокирован окном тишины"
 BLOCKED_NOTICE_COOLDOWN_SECONDS = 300
 
+
 @dataclass
 class _QuietState:
     active: bool = False
     reason: Optional[str] = None
     last_notified_active: bool = False
     last_notified_reason: Optional[str] = None
+
 
 async def trading_loop(
         *,
@@ -77,7 +79,7 @@ async def trading_loop(
             continue
 
         # LIVE-выключатель: если робот отключили — запрещаем новые входы сразу.
-        enabled = switches.is_enabled(robot_id)
+        enabled = await switches.is_enabled(robot_id)
         if not enabled and position_side == "flat":
             try:
                 await tg_common.send(f"[{robot_id}] Робот отключён выключателем (robot_switches). Торговый цикл остановлен.")
@@ -88,7 +90,7 @@ async def trading_loop(
         now = datetime.now(timezone.utc)
 
         # 1) Сообщения о тишине (entry)
-        entry_decision = quiet_service.evaluate(robot_id=robot_id, now_utc=now, action_type="entry")
+        entry_decision = await quiet_service.evaluate(robot_id=robot_id, now_utc=now, action_type="entry")
         quiet_state.active = not entry_decision.allowed
         quiet_state.reason = entry_decision.reason
 
@@ -123,7 +125,7 @@ async def trading_loop(
             exit_time = entry_hour_start.replace(minute=59, second=50, microsecond=0)
 
             if now >= exit_time:
-                exit_decision = quiet_service.evaluate(robot_id=robot_id, now_utc=now, action_type="exit")
+                exit_decision = await quiet_service.evaluate(robot_id=robot_id, now_utc=now, action_type="exit")
                 if not exit_decision.allowed:
                     hard_grace = timedelta(minutes=2)
                     if now < (exit_time + hard_grace):
@@ -201,12 +203,6 @@ async def trading_loop(
 
         # --- Если робота выключили и позиции нет: до сюда мы не дойдём (return выше) ---
         # --- Ищем сигнал на вход ---
-        # Если окно тишины активно — входы запрещены. Мы уже отправили сообщение о смене состояния,
-        # поэтому здесь просто пропускаем попытки входа без дополнительных уведомлений.
-        if quiet_state.active:
-            await asyncio.sleep(1.0)
-            continue
-
         if not enabled:
             # enabled=False и позиция flat уже обработаны; сюда попадём только если отключили ровно между проверками.
             await asyncio.sleep(1.0)
@@ -225,6 +221,30 @@ async def trading_loop(
 
         now_dt = sig.now_time_utc or datetime.now(timezone.utc)
         hour_start_dt = now_dt.replace(minute=0, second=0, microsecond=0)
+
+        entry_decision = await quiet_service.evaluate(robot_id=robot_id, now_utc=now_dt, action_type="entry")
+        if not entry_decision.allowed:
+            should_notify = True
+            if last_blocked_notice_at is not None:
+                if (now_dt - last_blocked_notice_at).total_seconds() < BLOCKED_NOTICE_COOLDOWN_SECONDS and last_blocked_notice_reason == (
+                        entry_decision.reason or ""):
+                    should_notify = False
+
+            if should_notify:
+                try:
+                    await tg_common.send(
+                        f"[{robot_id}] Вход заблокирован окном тишины.\n"
+                        f"Инструмент: {cfg.name}\n"
+                        f"Сигнал стратегии: {sig.action.upper()} (reason={sig.reason})\n"
+                        f"Причина тишины: {entry_decision.reason or 'n/a'}"
+                    )
+                except Exception:
+                    logger.exception("Failed to notify entry blocked.")
+                last_blocked_notice_at = now_dt
+                last_blocked_notice_reason = entry_decision.reason or ""
+
+            await asyncio.sleep(1.0)
+            continue
 
         side = "BUY" if sig.action == "long" else "SELL"
 

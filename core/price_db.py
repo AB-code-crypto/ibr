@@ -8,6 +8,8 @@ from typing import Optional, List, Iterable, Union
 
 import aiosqlite
 
+from core.sqlite import connect_sqlite
+
 logger = logging.getLogger(__name__)
 
 # Разрешаем только простые имена таблиц (типа SVIX, TMF, MNQ_2025 и т.п.)
@@ -82,17 +84,10 @@ class PriceDB:
         """
         Открыть соединение с БД, при отсутствии файла — создать его.
 
-        Включаем WAL, NORMAL synchronous и foreign_keys для адекватной работы
-        под нагрузкой и в асинхронной среде.
+        Стандартные PRAGMA (WAL / NORMAL / foreign_keys / busy_timeout) применяются
+        централизованно в core.sqlite.connect_sqlite().
         """
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = await aiosqlite.connect(self.db_path)
-        # aiosqlite по умолчанию возвращает кортежи, нам этого достаточно
-        await self._conn.execute("PRAGMA journal_mode=WAL;")
-        await self._conn.execute("PRAGMA synchronous=NORMAL;")
-        await self._conn.execute("PRAGMA foreign_keys=ON;")
-        await self._conn.commit()
-        logger.info("PriceDB connected: %s", self.db_path)
+        self._conn = await connect_sqlite(self.db_path)
 
     async def close(self) -> None:
         """

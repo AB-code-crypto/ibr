@@ -1,9 +1,9 @@
-import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, time, timezone
-from pathlib import Path
 from typing import Dict, List, Optional, Set
 from zoneinfo import ZoneInfo
+
+from core.ops_db import OpsDB
 
 
 @dataclass(frozen=True)
@@ -16,18 +16,18 @@ class QuietDecision:
 class QuietWindowsService:
     """Централизованный фильтр 'окна тишины' для роботов.
 
-    Хранит правила в SQLite (операционная БД робота, напр. robot_ops.db; не price.db), и отвечает на вопрос:
-      - можно ли сейчас роботу отправить приказ на вход/выход
+    Хранит правила в robot_ops.db (операционная БД робота) и отвечает на вопрос:
+      - можно ли сейчас роботу отправить приказ на вход/выход.
 
-    Сейчас поддерживаются два типа правил:
+    Поддерживаемые типы правил:
       - daily: повторяющееся окно по дням недели и локальному времени (с TZ)
-      - once: разовое окно по UTC интервалу
+      - once:  разовое окно по UTC интервалу
 
-    Таблица: quiet_windows (в robot_ops.db)
+    Таблица: quiet_windows (в robot_ops.db).
     """
 
-    def __init__(self, *, db_path: str, cache_ttl_seconds: float = 30.0) -> None:
-        self.db_path = db_path
+    def __init__(self, *, ops_db: OpsDB, cache_ttl_seconds: float = 30.0) -> None:
+        self.ops_db = ops_db
         self.cache_ttl_seconds = float(cache_ttl_seconds)
 
         self._cache_loaded_at: Optional[datetime] = None
@@ -37,79 +37,76 @@ class QuietWindowsService:
     # Schema / seeding
     # -------------------------
 
-    def ensure_schema(self) -> None:
-        conn = sqlite3.connect(self.db_path)
-        try:
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS quiet_windows (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    enabled INTEGER NOT NULL DEFAULT 1,
+    async def ensure_schema(self) -> None:
+        await self.ops_db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS quiet_windows (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                enabled INTEGER NOT NULL DEFAULT 1,
 
-                    robot_id TEXT NOT NULL,          -- конкретный robot_id или '*'
-                    rule_kind TEXT NOT NULL,         -- 'daily' | 'once'
+                robot_id TEXT NOT NULL,          -- конкретный robot_id или '*'
+                rule_kind TEXT NOT NULL,         -- 'daily' | 'once'
 
-                    tz TEXT,                         -- IANA TZ (для daily), напр. 'America/New_York'
-                    weekdays TEXT,                   -- '0,1,2,3,4' (Mon=0..Sun=6). NULL => любые дни
-                    start_time TEXT,                 -- 'HH:MM' (для daily)
-                    end_time TEXT,                   -- 'HH:MM' (для daily)
+                tz TEXT,                         -- IANA TZ (для daily), напр. 'America/New_York'
+                weekdays TEXT,                   -- '0,1,2,3,4' (Mon=0..Sun=6). NULL => любые дни
+                start_time TEXT,                 -- 'HH:MM' (для daily)
+                end_time TEXT,                   -- 'HH:MM' (для daily)
 
-                    start_utc TEXT,                  -- ISO8601 (для once), напр. '2025-12-03T15:00:00+00:00'
-                    end_utc TEXT,                    -- ISO8601 (для once)
+                start_utc TEXT,                  -- ISO8601 (для once), напр. '2025-12-03T15:00:00+00:00'
+                end_utc TEXT,                    -- ISO8601 (для once)
 
-                    block_entries INTEGER NOT NULL DEFAULT 1,
-                    block_exits INTEGER NOT NULL DEFAULT 0,
+                block_entries INTEGER NOT NULL DEFAULT 1,
+                block_exits INTEGER NOT NULL DEFAULT 0,
 
-                    reason TEXT NOT NULL,
-                    note TEXT
-                );
-                """
-            )
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_quiet_robot ON quiet_windows(robot_id);")
-            conn.commit()
-            self._cache_loaded_at = None
-        finally:
-            conn.close()
+                reason TEXT NOT NULL,
+                note TEXT
+            );
+            """,
+            commit=True,
+        )
+        await self.ops_db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_quiet_robot ON quiet_windows(robot_id);",
+            commit=True,
+        )
 
-    def seed_default_rth_open(self, *, robot_id: str) -> None:
+        self._cache_loaded_at = None
+        self._rules_by_robot = {}
+
+    async def seed_default_rth_open(self, *, robot_id: str) -> None:
         """Сидируем базовое правило RTH open, если для robot_id нет ни одного правила.
 
         Это нужно, чтобы перенос quiet windows из стратегии в оркестратор не требовал ручной миграции сразу.
         Если ты добавишь правила вручную — сидер больше ничего не тронет.
         """
-        conn = sqlite3.connect(self.db_path)
-        try:
-            row = conn.execute(
-                "SELECT COUNT(1) FROM quiet_windows WHERE robot_id = ?;",
-                (robot_id,),
-            ).fetchone()
-            if row and int(row[0]) > 0:
-                return
+        row = await self.ops_db.fetchone(
+            "SELECT COUNT(1) FROM quiet_windows WHERE robot_id = ?;",
+            (robot_id,),
+        )
+        if row and int(row[0]) > 0:
+            return
 
-            conn.execute(
-                """
-                INSERT INTO quiet_windows (
-                    enabled, robot_id, rule_kind, tz, weekdays, start_time, end_time,
-                    block_entries, block_exits, reason, note
-                )
-                VALUES (?, ?, 'daily', ?, ?, ?, ?, ?, ?, ?, ?);
-                """,
-                (
-                    1,
-                    robot_id,
-                    "America/New_York",
-                    "0,1,2,3,4",
-                    "09:30",
-                    "10:00",
-                    1,
-                    0,
-                    "quiet_main_session_open",
-                    "Первые 30 минут после старта основной сессии (RTH open).",
-                ),
+        await self.ops_db.execute(
+            """
+            INSERT INTO quiet_windows (
+                enabled, robot_id, rule_kind, tz, weekdays, start_time, end_time,
+                block_entries, block_exits, reason, note
             )
-            conn.commit()
-        finally:
-            conn.close()
+            VALUES (?, ?, 'daily', ?, ?, ?, ?, ?, ?, ?, ?);
+            """,
+            (
+                1,
+                robot_id,
+                "America/New_York",
+                "0,1,2,3,4",
+                "09:30",
+                "10:00",
+                1,
+                0,
+                "quiet_main_session_open",
+                "Первые 30 минут после старта основной сессии (RTH open).",
+            ),
+            commit=True,
+        )
 
         # invalidate cache
         self._cache_loaded_at = None
@@ -119,7 +116,7 @@ class QuietWindowsService:
     # Public API
     # -------------------------
 
-    def evaluate(self, *, robot_id: str, now_utc: datetime, action_type: str) -> QuietDecision:
+    async def evaluate(self, *, robot_id: str, now_utc: datetime, action_type: str) -> QuietDecision:
         """action_type: 'entry' | 'exit'"""
         if now_utc.tzinfo is None:
             raise ValueError("now_utc must be timezone-aware (UTC)")
@@ -127,9 +124,9 @@ class QuietWindowsService:
         if action_type not in {"entry", "exit"}:
             raise ValueError("action_type must be 'entry' or 'exit'")
 
-        self._ensure_cache(now_utc)
+        await self._ensure_cache(now_utc)
 
-        rules = []
+        rules: list[dict] = []
         # '*' - общие правила, затем конкретные
         rules.extend(self._rules_by_robot.get("*", []))
         rules.extend(self._rules_by_robot.get(robot_id, []))
@@ -148,8 +145,7 @@ class QuietWindowsService:
 
         return QuietDecision(allowed=True, reason=None, rule_id=None)
 
-
-    def get_enabled_rules_for_robot(
+    async def get_enabled_rules_for_robot(
         self,
         *,
         robot_id: str,
@@ -164,7 +160,7 @@ class QuietWindowsService:
         if now_utc.tzinfo is None:
             raise ValueError("now_utc must be timezone-aware (UTC)")
 
-        self._ensure_cache(now_utc)
+        await self._ensure_cache(now_utc)
 
         rules: list[dict] = []
         if include_global:
@@ -178,35 +174,30 @@ class QuietWindowsService:
     # Cache / load
     # -------------------------
 
-    def _ensure_cache(self, now_utc: datetime) -> None:
+    async def _ensure_cache(self, now_utc: datetime) -> None:
         if self._cache_loaded_at is None:
-            self._load_cache()
+            await self._load_cache()
             self._cache_loaded_at = now_utc
             return
 
         age = (now_utc - self._cache_loaded_at).total_seconds()
         if age >= self.cache_ttl_seconds:
-            self._load_cache()
+            await self._load_cache()
             self._cache_loaded_at = now_utc
 
-    def _load_cache(self) -> None:
-        conn = sqlite3.connect(self.db_path)
-        try:
-            cur = conn.execute(
-                """
-                SELECT
-                    id, enabled, robot_id, rule_kind,
-                    tz, weekdays, start_time, end_time,
-                    start_utc, end_utc,
-                    block_entries, block_exits,
-                    reason, note
-                FROM quiet_windows
-                WHERE enabled = 1;
-                """
-            )
-            rows = cur.fetchall()
-        finally:
-            conn.close()
+    async def _load_cache(self) -> None:
+        rows = await self.ops_db.fetchall(
+            """
+            SELECT
+                id, enabled, robot_id, rule_kind,
+                tz, weekdays, start_time, end_time,
+                start_utc, end_utc,
+                block_entries, block_exits,
+                reason, note
+            FROM quiet_windows
+            WHERE enabled = 1;
+            """
+        )
 
         rules_by_robot: Dict[str, List[dict]] = {}
         for row in rows:
@@ -286,33 +277,16 @@ class QuietWindowsService:
         start_minutes = start_t.hour * 60 + start_t.minute
         end_minutes = end_t.hour * 60 + end_t.minute
         now_minutes = now_t.hour * 60 + now_t.minute
-        now_seconds = now_t.second
-
-        # сравнение с точностью до секунд:
-        # внутри минуты считаем, что окно активно с start_time:00 включительно до end_time:00 не включая.
-        def ge_start():
-            if now_minutes > start_minutes:
-                return True
-            if now_minutes < start_minutes:
-                return False
-            return now_seconds >= 0
-
-        def lt_end():
-            if now_minutes < end_minutes:
-                return True
-            if now_minutes > end_minutes:
-                return False
-            return now_seconds < 0  # фактически равенство запрещено, но секунды всегда >=0
 
         if start_minutes == end_minutes:
             return False
 
         if start_minutes < end_minutes:
-            # обычное окно в пределах суток
-            return (now_minutes > start_minutes or (now_minutes == start_minutes)) and (now_minutes < end_minutes)
-        else:
-            # окно через полночь
-            return (now_minutes >= start_minutes) or (now_minutes < end_minutes)
+            # обычное окно в пределах суток: [start, end)
+            return (now_minutes >= start_minutes) and (now_minutes < end_minutes)
+
+        # окно через полночь: [start, 24h) U [0, end)
+        return (now_minutes >= start_minutes) or (now_minutes < end_minutes)
 
     # -------------------------
     # Parsers

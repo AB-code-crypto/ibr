@@ -1,8 +1,11 @@
 import asyncio
 import logging
 import signal
+from datetime import timedelta
+
 
 from contracts.robot_registry import RobotSwitchesStore, load_all_robot_specs
+from core.ops_db import OpsDB
 from core.config import (
     PRICE_DB_PATH,
     ROBOT_OPS_DB_PATH,
@@ -33,25 +36,27 @@ async def main() -> None:
     await db.connect()
 
     # 2) robot_ops.db (операционная БД; также используем для robot_switches/quiet_windows)
-    ops_db_path = str(ROBOT_OPS_DB_PATH)
+    ops_db = OpsDB(ROBOT_OPS_DB_PATH)
+    await ops_db.connect()
+    ops_db_path = str(ops_db.db_path)
 
     # 3) Реестр роботов
     all_specs = load_all_robot_specs()
     known_robot_ids = [s.robot_id for s in all_specs]
 
     # 4) Выключатели
-    switches = RobotSwitchesStore(db_path=ops_db_path, cache_ttl_seconds=10)
-    switches.ensure_schema()
-    switches.seed_defaults(known_robot_ids, default_enabled=True)
+    switches = RobotSwitchesStore(ops_db=ops_db, cache_ttl_seconds=10)
+    await switches.ensure_schema()
+    await switches.seed_defaults(known_robot_ids, default_enabled=True)
 
-    enabled_ids = switches.enabled_robot_ids(known_robot_ids)
+    enabled_ids = await switches.enabled_robot_ids(known_robot_ids)
     enabled_specs = [s for s in all_specs if s.robot_id in enabled_ids]
 
     # 5) Quiet windows сервис (правила по robot_id)
-    quiet_service = QuietWindowsService(db_path=ops_db_path, cache_ttl_seconds=30.0)
-    quiet_service.ensure_schema()
+    quiet_service = QuietWindowsService(ops_db=ops_db, cache_ttl_seconds=30.0)
+    await quiet_service.ensure_schema()
     for spec in all_specs:
-        quiet_service.seed_default_rth_open(robot_id=spec.robot_id)
+        await quiet_service.seed_default_rth_open(robot_id=spec.robot_id)
 
     # 6) Коннектор к IB
     ib = IBConnect(
@@ -71,7 +76,8 @@ async def main() -> None:
     )
 
     try:
-        await tg_common.send(_startup_registry_message(all_specs, enabled_specs, ops_db_path, quiet_service))
+        startup_msg = await _startup_registry_message(all_specs, enabled_specs, ops_db_path, quiet_service)
+        await tg_common.send(startup_msg)
     except Exception:
         logger.exception("Failed to send startup registry message.")
 
@@ -194,6 +200,7 @@ async def main() -> None:
         await tg_common.close()
         await tg_trading.close()
         await db.close()
+        await ops_db.close()
 
 
 if __name__ == "__main__":

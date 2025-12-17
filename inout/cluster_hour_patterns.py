@@ -17,15 +17,13 @@
 
 import json
 import logging
-import math
 import sqlite3
-from array import array
 from typing import Dict, List, Tuple
 
 import numpy as np
 
 from core.config import PATTERNS_DB_PATH
-from core.patterns_db import init_patterns_db, get_connection as get_patterns_conn
+from strategies.pattern_pirson.patterns_db import init_patterns_db, get_connection as get_patterns_conn
 
 logger = logging.getLogger(__name__)
 

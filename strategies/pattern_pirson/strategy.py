@@ -3,14 +3,14 @@
 import logging
 import sqlite3
 from datetime import datetime, timezone
-from typing import Dict, List, Optional
+from typing import Dict, Optional
 
 from core.config import PRICE_DB_PATH, PATTERNS_DB_PATH
 
 from .constants import SLOT_SECONDS
 from .features import build_current_pattern_vector
 from .similarity import cosine_similarity_normalized
-from .storage import load_clusters
+from .patterns_repository import PatternsRepository
 from .types import ClusterRuntimeInfo, PatternSignal
 
 logger = logging.getLogger(__name__)
@@ -44,17 +44,18 @@ class PatternStrategy:
         self.prob_threshold = prob_threshold
         self.mean_ret_threshold = mean_ret_threshold
 
-        self._clusters_by_block: Dict[int, List[ClusterRuntimeInfo]] = {}
+        self._clusters_by_block: Dict[int, tuple[ClusterRuntimeInfo, ...]] = {}
         self._max_segments: Optional[int] = None
 
-        self._reload_clusters()
-
-    def _reload_clusters(self) -> None:
-        self._clusters_by_block, self._max_segments = load_clusters(
+        # Load patterns snapshot once at startup (no SQLite in hot path)
+        self._patterns_repo = PatternsRepository(
             patterns_db_path=PATTERNS_DB_PATH,
             instrument=self.instrument,
             bars_per_segment=self.bars_per_segment,
         )
+        snap = self._patterns_repo.load_snapshot()
+        self._clusters_by_block = snap.clusters_by_block
+        self._max_segments = snap.max_segments
 
     def evaluate_for_contract(self, contract: str) -> PatternSignal:
         """Evaluate the current state for a contract table from price.db."""

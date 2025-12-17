@@ -18,7 +18,7 @@ from datetime import datetime, timezone
 from typing import Iterable, Tuple
 
 from core.config import PRICE_DB_PATH, PATTERNS_DB_PATH, futures_for_history
-from core.patterns_db import init_patterns_db, get_connection as get_patterns_conn
+from strategies.pattern_pirson.patterns_db import init_patterns_db, get_connection as get_patterns_conn
 
 logger = logging.getLogger(__name__)
 
