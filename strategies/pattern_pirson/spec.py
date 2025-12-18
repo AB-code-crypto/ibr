@@ -18,7 +18,7 @@ def get_robot_spec() -> RobotSpec:
 
     # Текущий активный фьючерс (таблица в price.db и контракт в IB)
     # В будущем это будет вычисляться общим roll-service.
-    active_future_symbol = "MNQZ5"
+    active_future_symbol = "MNQH6"
 
     # Root инструмента в patterns.db
     instrument_root = "MNQ"
